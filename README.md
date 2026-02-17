@@ -1,2 +1,3 @@
-# public-tools
-Various useful public tools
+# Public
+
+This repo contains various tools.
