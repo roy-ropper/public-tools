@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# created 18-02-2026
+# pcap to XLS
+# network recon
 """
 pcap_to_drawio.py  v4.0  — Pentester Edition
 ----------------------------------------------
@@ -171,7 +174,7 @@ def _dissect(raw, ltype, ts_us=0):
                 etype = struct.unpack(">H", raw[off+2:off+4])[0]; off += 4
             payload = raw[off:]
         elif ltype in (101,228): etype = ETH_TYPE_IP;  payload = raw
-        elif ltype == 229:       etype = ETH_TYPE_IP6; payload = raw
+        elif ltype == 229:       return None  # raw IPv6 — excluded
         elif ltype == 113:
             if len(raw) < 16: return None
             etype = struct.unpack(">H", raw[14:16])[0]; payload = raw[16:]
@@ -179,7 +182,7 @@ def _dissect(raw, ltype, ts_us=0):
             return None
 
         if   etype == ETH_TYPE_IP:  r = _ipv4(payload, ts_us)
-        elif etype == ETH_TYPE_IP6: r = _ipv6(payload, ts_us)
+        elif etype == ETH_TYPE_IP6: return None   # IPv6 excluded — IPv4 only
         elif etype == ETH_TYPE_ARP: r = _arp(payload)
         else: return None
 
@@ -244,7 +247,9 @@ def _transport(src, dst, proto, data, pkt_len, ts_us):
             sp, dp = struct.unpack(">HH", data[:4])
             name = WELL_KNOWN.get(("UDP",dp)) or WELL_KNOWN.get(("UDP",sp)) or "UDP"
         app_payload = data[8:] if len(data) > 8 else b""
-    elif proto == PROTO_ICMP:  name = "ICMP"
+    elif proto == PROTO_ICMP:
+        name = "ICMP"
+        app_payload = data   # full ICMP datagram (type+code+checksum+body)
     elif proto == PROTO_ICMP6: name = "ICMPv6"
     else:                      name = f"IP/{proto}"
     return dict(src_ip=src, dst_ip=dst, src_mac="", dst_mac="",
@@ -406,11 +411,20 @@ def extract_cleartext(pkt):
                 hit("SNMP Community String", s, f"{src_ip} -> {dst_ip}:{dp}")
                 break
 
-    # ── NetBIOS ────────────────────────────────────────────────────────────
+    # ── NetBIOS — decode Level-2 half-ASCII encoding ──────────────────────
     if proto == "NetBIOS":
-        runs = _re.findall(rb"[\x20-\x7e]{4,}", payload)
-        for run in runs[:3]:
-            hit("NetBIOS Data", run.decode("ascii","replace"), f"{src_ip} -> {dst_ip}")
+        # Try Level-2 decode first (NBNS registration packets)
+        decoded_names = _decode_nbns_payload(payload)
+        if decoded_names:
+            for name in decoded_names:
+                hit("NetBIOS Name", name, f"{src_ip} -> {dst_ip}")
+        else:
+            # Fallback: grab printable runs from SMB/NetBIOS session traffic
+            runs = _re.findall(rb"[\x20-\x7e]{4,}", payload)
+            for run in runs[:3]:
+                s = run.decode("ascii","replace").strip()
+                if s and not all(c == "\x00" for c in s):
+                    hit("NetBIOS Session Data", s, f"{src_ip} -> {dst_ip}")
 
     # ── Generic API key / secret patterns (any cleartext protocol) ─────────
     if proto in CLEARTEXT_PROTOS and text:
@@ -428,6 +442,880 @@ def extract_cleartext(pkt):
 
     return found
 
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Banner / resource / version-string extractor
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_banners(packets):
+    """
+    Single pass over all packets extracting:
+
+    Banners / version strings
+      • HTTP Server:, X-Powered-By:, X-Generator:, Via: response headers
+      • FTP 220 greeting line
+      • SMTP 220 greeting line
+      • SSH version string (SSH-2.0-OpenSSH_8.2p1 …)
+      • Any printable version pattern in Telnet streams
+
+    Commonly requested resources
+      • HTTP GET/POST/PUT/DELETE request lines + Host header
+      • DNS queries (what domains the network is looking up)
+      • HTTP User-Agent strings (reveals client OS/browser/software versions)
+      • NTP server IPs
+      • DHCP requested server IPs
+
+    Returns list of dicts:
+      { category, server_ip, client_ip, port, protocol,
+        banner_type, value, raw_context }
+    """
+    hits = []
+    seen = set()   # deduplicate
+
+    def hit(category, server_ip, client_ip, port, protocol, banner_type, value, context=""):
+        value = str(value).strip()[:300]
+        if not value:
+            return
+        key = (category, server_ip, banner_type, value)
+        if key in seen:
+            return
+        seen.add(key)
+        hits.append(dict(
+            category    = category,
+            server_ip   = server_ip,
+            client_ip   = client_ip,
+            port        = int(port) if port else 0,
+            protocol    = protocol,
+            banner_type = banner_type,
+            value       = value,
+            context     = str(context).strip()[:200],
+        ))
+
+    for p in packets:
+        proto   = p.get("proto", "")
+        payload = p.get("app_payload", b"")
+        src_ip  = p.get("src_ip", "")
+        dst_ip  = p.get("dst_ip", "")
+        sp      = p.get("src_port", 0)
+        dp      = p.get("dst_port", 0)
+
+        if not payload:
+            continue
+
+        try:
+            text = payload.decode("utf-8", errors="replace")
+        except Exception:
+            text = ""
+
+        lines = text.splitlines()
+        first = lines[0].strip() if lines else ""
+
+        # ── HTTP responses (server is the src when dp is ephemeral / sp is 80/443) ──
+        if proto in ("HTTP", "HTTP-alt"):
+            # Determine direction: response starts with HTTP/1.x
+            if first.startswith("HTTP/"):
+                server_ip, client_ip, port = src_ip, dst_ip, sp
+                for line in lines:
+                    l = line.strip()
+                    low = l.lower()
+                    if low.startswith("server:"):
+                        val = l.split(":",1)[1].strip()
+                        hit("Banner", server_ip, client_ip, dp or sp, proto,
+                            "HTTP Server Header", val, first)
+                    elif low.startswith("x-powered-by:"):
+                        val = l.split(":",1)[1].strip()
+                        hit("Banner", server_ip, client_ip, dp or sp, proto,
+                            "X-Powered-By", val, first)
+                    elif low.startswith("x-generator:"):
+                        val = l.split(":",1)[1].strip()
+                        hit("Banner", server_ip, client_ip, dp or sp, proto,
+                            "X-Generator", val, first)
+                    elif low.startswith("via:"):
+                        val = l.split(":",1)[1].strip()
+                        hit("Banner", server_ip, client_ip, dp or sp, proto,
+                            "Via (Proxy)", val, first)
+                    elif low.startswith("x-aspnet-version:") or low.startswith("x-aspnetmvc-version:"):
+                        val = l.split(":",1)[1].strip()
+                        hit("Banner", server_ip, client_ip, dp or sp, proto,
+                            "ASP.NET Version", val, first)
+                    elif low.startswith("x-runtime:"):
+                        val = l.split(":",1)[1].strip()
+                        hit("Banner", server_ip, client_ip, dp or sp, proto,
+                            "Runtime Version", val, first)
+
+            # Requests — resource enumeration
+            elif any(first.startswith(m) for m in ("GET ","POST ","PUT ","DELETE ","HEAD ","OPTIONS ","PATCH ")):
+                server_ip, client_ip, port = dst_ip, src_ip, dp
+                method_path = first.rsplit(" HTTP/",1)[0] if " HTTP/" in first else first
+                # Extract host for full URL reconstruction
+                host = ""
+                user_agent = ""
+                for line in lines:
+                    l = line.strip()
+                    if l.lower().startswith("host:"):
+                        host = l.split(":",1)[1].strip()
+                    elif l.lower().startswith("user-agent:"):
+                        user_agent = l.split(":",1)[1].strip()
+                full_resource = f"http://{host}{method_path.split(' ',1)[-1]}" if host else method_path
+                hit("Resource", server_ip, client_ip, dp, proto,
+                    "HTTP Request", full_resource, f"Method: {method_path.split()[0]}")
+                if user_agent:
+                    hit("Client Software", client_ip, server_ip, dp, proto,
+                        "HTTP User-Agent", user_agent, f"→ {server_ip}:{dp}")
+
+        # ── FTP banners ────────────────────────────────────────────────────────
+        elif proto in ("FTP", "FTP-data"):
+            # 220 = service ready greeting (the banner)
+            for line in lines:
+                l = line.strip()
+                if l.startswith("220"):
+                    hit("Banner", src_ip, dst_ip, sp, proto,
+                        "FTP Banner", l[3:].strip() or l, "FTP 220 greeting")
+                elif l.startswith("215"):  # SYST response
+                    hit("Banner", src_ip, dst_ip, sp, proto,
+                        "FTP System Type", l[3:].strip(), "SYST response")
+
+        # ── SMTP banners ────────────────────────────────────────────────────────
+        elif proto == "SMTP":
+            for line in lines:
+                l = line.strip()
+                if l.startswith("220"):
+                    hit("Banner", src_ip, dst_ip, sp, proto,
+                        "SMTP Banner", l[3:].strip() or l, "SMTP 220 greeting")
+                elif l.upper().startswith("EHLO") or l.upper().startswith("HELO"):
+                    domain = l.split(None,1)[-1] if len(l.split()) > 1 else ""
+                    if domain:
+                        hit("Resource", dst_ip, src_ip, dp, proto,
+                            "SMTP EHLO Domain", domain, "Client announced domain")
+
+        # ── SSH version string ──────────────────────────────────────────────────
+        # SSH banner is sent in cleartext before encryption negotiation
+        elif proto in ("SSH", "TCP"):
+            if text.startswith("SSH-"):
+                banner_line = first.strip()
+                hit("Banner", src_ip, dst_ip, sp or dp, "SSH",
+                    "SSH Version String", banner_line, f"{src_ip}→{dst_ip}")
+
+        # ── Telnet — grab any version/banner patterns ──────────────────────────
+        elif proto == "Telnet":
+            printable = "".join(c for c in text if c.isprintable() or c in "\r\n\t")
+            # Look for version patterns
+            for m in _re.findall(
+                    r"(?i)(version\s+[\d.]+|v[\d]+\.[\d]+[\.\d]*|release\s+[\d.]+)", printable):
+                hit("Banner", src_ip, dst_ip, sp or dp, proto,
+                    "Telnet Version String", m if isinstance(m,str) else m[0],
+                    printable[:100])
+            # Any obvious login/welcome banner lines
+            for line in printable.splitlines():
+                l = line.strip()
+                if any(kw in l.lower() for kw in ("welcome","unauthorized","login banner","authorized users only","cisco","juniper","warning:")):
+                    hit("Banner", src_ip, dst_ip, sp or dp, proto,
+                        "Telnet Login Banner", l[:200], "")
+
+        # ── DNS queries — what the network is resolving ────────────────────────
+        elif proto == "DNS" and payload:
+            try:
+                if len(payload) >= 12:
+                    flags    = struct.unpack(">H", payload[2:4])[0]
+                    is_query = not ((flags >> 15) & 1)
+                    qd_count = struct.unpack(">H", payload[4:6])[0]
+                    if is_query and qd_count > 0:
+                        offset = 12
+                        qname, _ = _dns_read_name(payload, offset)
+                        if qname and "." in qname:
+                            hit("Resource", dst_ip, src_ip, dp, proto,
+                                "DNS Query", qname, f"Queried by {src_ip}")
+            except Exception:
+                pass
+
+        # ── SNMP — system description OID (sysDescr) ──────────────────────────
+        elif proto == "SNMP":
+            # sysDescr (1.3.6.1.2.1.1.1.0) responses often contain OS/device strings
+            printable_runs = _re.findall(rb"[ -~]{8,}", payload)
+            for run in printable_runs:
+                s = run.decode("ascii", "replace")
+                # Filter to version-like strings
+                if any(kw in s.lower() for kw in ("linux","windows","cisco","juniper","version","release","snmp","net-snmp")):
+                    hit("Banner", src_ip, dst_ip, sp or dp, proto,
+                        "SNMP sysDescr", s[:150], f"{src_ip}→{dst_ip}")
+                    break
+
+        # ── NTP — server IPs (what time servers is the network using) ──────────
+        elif proto == "NTP":
+            hit("Resource", dst_ip, src_ip, dp, proto,
+                "NTP Server", dst_ip, f"NTP query from {src_ip}")
+
+        # ── DHCP — server identifier and requested options ─────────────────────
+        elif proto == "DHCP" and payload and len(payload) >= 240:
+            try:
+                siaddr = socket.inet_ntoa(payload[20:24])  # server IP
+                i = 240
+                while i < len(payload):
+                    opt = payload[i]; i += 1
+                    if opt == 255: break
+                    if opt == 0:  continue
+                    if i >= len(payload): break
+                    ln = payload[i]; i += 1
+                    val = payload[i:i+ln]; i += ln
+                    if opt == 54 and ln == 4:  # DHCP Server Identifier
+                        dhcp_srv = socket.inet_ntoa(val)
+                        hit("Resource", dhcp_srv, src_ip, 67, proto,
+                            "DHCP Server", dhcp_srv, f"DHCP server for {src_ip}")
+                    elif opt == 60:  # Vendor Class Identifier
+                        vci = val.decode("ascii","replace").strip("\x00")
+                        hit("Banner", src_ip, dst_ip, dp, proto,
+                            "DHCP Vendor Class", vci, f"Client: {src_ip}")
+            except Exception:
+                pass
+
+    return hits
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TLS / SSL handshake parser and session extractor
+# Parses ClientHello, ServerHello, Certificate, and Alert records from raw TCP
+# payloads — all in the clear before encryption begins.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import datetime as _dt
+
+import struct, socket, datetime
+from collections import defaultdict
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TLS constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+TLS_VERSIONS = {
+    0x0300: "SSLv3",
+    0x0301: "TLS 1.0",
+    0x0302: "TLS 1.1",
+    0x0303: "TLS 1.2",
+    0x0304: "TLS 1.3",
+}
+
+# Cipher suites — subset covering weak/interesting ones + common ones
+CIPHER_SUITES = {
+    0x0000: "TLS_NULL_WITH_NULL_NULL",
+    0x0001: "TLS_RSA_WITH_NULL_MD5",
+    0x0002: "TLS_RSA_WITH_NULL_SHA",
+    0x0004: "TLS_RSA_WITH_RC4_128_MD5",
+    0x0005: "TLS_RSA_WITH_RC4_128_SHA",
+    0x000A: "TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+    0x002F: "TLS_RSA_WITH_AES_128_CBC_SHA",
+    0x0033: "TLS_DHE_RSA_WITH_AES_128_CBC_SHA",
+    0x0035: "TLS_RSA_WITH_AES_256_CBC_SHA",
+    0x0039: "TLS_DHE_RSA_WITH_AES_256_CBC_SHA",
+    0x003C: "TLS_RSA_WITH_AES_128_CBC_SHA256",
+    0x003D: "TLS_RSA_WITH_AES_256_CBC_SHA256",
+    0x009C: "TLS_RSA_WITH_AES_128_GCM_SHA256",
+    0x009D: "TLS_RSA_WITH_AES_256_GCM_SHA384",
+    0x009E: "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256",
+    0x009F: "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384",
+    0xC009: "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+    0xC00A: "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+    0xC013: "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+    0xC014: "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    0xC02B: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    0xC02C: "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    0xC02F: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    0xC030: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    0xCCA8: "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    0xCCA9: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    0xCCAA: "TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    # TLS 1.3 suites
+    0x1301: "TLS_AES_128_GCM_SHA256",
+    0x1302: "TLS_AES_256_GCM_SHA384",
+    0x1303: "TLS_CHACHA20_POLY1305_SHA256",
+    # SCSV
+    0x00FF: "TLS_EMPTY_RENEGOTIATION_INFO_SCSV",
+    0x5600: "TLS_FALLBACK_SCSV",
+}
+
+WEAK_CIPHERS = {
+    "NULL", "RC4", "DES", "EXPORT", "anon", "MD5",
+    "RC2", "IDEA", "SEED", "CAMELLIA_128_CBC", "3DES"
+}
+
+ALERT_DESCS = {
+    0:"close_notify", 10:"unexpected_message", 20:"bad_record_mac",
+    21:"decryption_failed", 22:"record_overflow", 30:"decompression_failure",
+    40:"handshake_failure", 41:"no_certificate", 42:"bad_certificate",
+    43:"unsupported_certificate", 44:"certificate_revoked",
+    45:"certificate_expired", 46:"certificate_unknown",
+    47:"illegal_parameter", 48:"unknown_ca", 49:"access_denied",
+    50:"decode_error", 51:"decrypt_error", 60:"export_restriction",
+    70:"protocol_version", 71:"insufficient_security", 80:"internal_error",
+    86:"inappropriate_fallback", 90:"user_canceled",
+    100:"no_renegotiation", 110:"unsupported_extension",
+    112:"unrecognized_name", 113:"bad_certificate_status_response",
+    115:"unknown_psk_identity", 116:"certificate_required", 120:"no_application_protocol",
+}
+
+TLS_HS_TYPES = {
+    0:"HelloRequest", 1:"ClientHello", 2:"ServerHello",
+    4:"NewSessionTicket", 8:"EncryptedExtensions",
+    11:"Certificate", 12:"ServerKeyExchange",
+    13:"CertificateRequest", 14:"ServerHelloDone",
+    15:"CertificateVerify", 16:"ClientKeyExchange", 20:"Finished",
+}
+
+# Extension types
+EXT_SNI       = 0x0000
+EXT_ALPN      = 0x0010
+EXT_SUPPORTED = 0x002B   # supported_versions (TLS 1.3)
+EXT_SIG_ALGS  = 0x000D
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASN.1 / X.509 minimal parser (no external libs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _asn1_read_len(data, off):
+    """Read ASN.1 length at offset. Returns (length, new_offset)."""
+    if off >= len(data):
+        return 0, off
+    b = data[off]; off += 1
+    if b < 0x80:
+        return b, off
+    n = b & 0x7F
+    if off + n > len(data):
+        return 0, off + n
+    ln = int.from_bytes(data[off:off+n], "big")
+    return ln, off + n
+
+def _asn1_next(data, off):
+    """Read next ASN.1 TLV. Returns (tag, value_bytes, next_offset)."""
+    if off + 2 > len(data):
+        return 0, b"", off
+    tag = data[off]; off += 1
+    ln, off = _asn1_read_len(data, off)
+    end = off + ln
+    val = data[off:end]
+    return tag, val, end
+
+def _asn1_seq_children(data):
+    """Iterate children of an ASN.1 SEQUENCE/SET body."""
+    off = 0
+    while off < len(data):
+        tag, val, off = _asn1_next(data, off)
+        if tag == 0:
+            break
+        yield tag, val
+
+def _oid_to_str(data):
+    """Decode ASN.1 OID bytes to dotted string."""
+    if not data:
+        return ""
+    try:
+        oid = [data[0] // 40, data[0] % 40]
+        i, cur = 1, 0
+        while i < len(data):
+            b = data[i]; i += 1
+            cur = (cur << 7) | (b & 0x7F)
+            if not (b & 0x80):
+                oid.append(cur); cur = 0
+        return ".".join(str(x) for x in oid)
+    except Exception:
+        return ""
+
+# Common OID → friendly name
+OID_NAMES = {
+    "2.5.4.3":  "CN", "2.5.4.6":  "C", "2.5.4.7":  "L",
+    "2.5.4.8":  "ST","2.5.4.10": "O", "2.5.4.11": "OU",
+    "2.5.4.12": "title", "2.5.29.17": "SAN",
+    "1.2.840.113549.1.1.1":  "rsaEncryption",
+    "1.2.840.113549.1.1.11": "sha256WithRSAEncryption",
+    "1.2.840.10040.4.1": "dsa",
+    "1.2.840.10045.2.1": "ecPublicKey",
+    "1.3.132.0.34": "secp384r1",
+    "1.3.132.0.35": "secp521r1",
+    "1.2.840.10045.3.1.7": "secp256r1 (P-256)",
+    "1.2.840.10045.3.1.34": "secp384r1 (P-384)",
+    "2.5.29.19": "basicConstraints",
+    "2.5.29.15": "keyUsage",
+    "2.5.29.37": "extKeyUsage",
+}
+
+def _parse_dn(data):
+    """Parse X.509 Distinguished Name, return dict of RDN components."""
+    result = {}
+    for tag, rdn_set in _asn1_seq_children(data):
+        for _, atv in _asn1_seq_children(rdn_set):
+            tag2, oid_bytes, rest = _asn1_next(atv, 0)
+            oid = _oid_to_str(oid_bytes)
+            name = OID_NAMES.get(oid, oid)
+            tag3, val_bytes, _ = _asn1_next(atv, rest - len(atv) + len(oid_bytes) + 2)
+            # Reparse properly
+            off2 = 0
+            _, oid_raw, off2 = _asn1_next(atv, 0)
+            oid_str = _oid_to_str(oid_raw)
+            fname   = OID_NAMES.get(oid_str, oid_str)
+            _, str_raw, _ = _asn1_next(atv, off2)
+            try:
+                val = str_raw.decode("utf-8", errors="replace").strip()
+            except Exception:
+                val = str_raw.hex()
+            result[fname] = val
+    return result
+
+def _parse_utctime(data):
+    """Parse ASN.1 UTCTime or GeneralizedTime → datetime or None."""
+    try:
+        s = data.decode("ascii").strip("\x00")
+        if len(s) == 13:   # YYMMDDHHmmssZ
+            return datetime.datetime.strptime(s, "%y%m%d%H%M%SZ")
+        elif len(s) == 15: # YYYYMMDDHHmmssZ
+            return datetime.datetime.strptime(s, "%Y%m%d%H%M%SZ")
+    except Exception:
+        pass
+    return None
+
+def _parse_validity(data):
+    """Parse Validity SEQUENCE → (not_before, not_after) as datetime."""
+    nb = na = None
+    off = 0
+    for _ in range(2):
+        tag, val, off = _asn1_next(data, off)
+        dt = _parse_utctime(val)
+        if nb is None: nb = dt
+        else:          na = dt
+    return nb, na
+
+def _parse_pubkey_info(data):
+    """Parse SubjectPublicKeyInfo → (key_type_str, key_size_bits)."""
+    try:
+        off = 0
+        tag, alg_seq, off = _asn1_next(data, 0)   # AlgorithmIdentifier SEQUENCE
+        _, oid_bytes, _ = _asn1_next(alg_seq, 0)
+        oid = _oid_to_str(oid_bytes)
+        alg_name = OID_NAMES.get(oid, oid)
+
+        tag2, bitstring, off2 = _asn1_next(data, off)   # BIT STRING
+        key_bytes = bitstring[1:]   # strip unused-bits byte
+
+        if "rsa" in alg_name.lower():
+            # RSA key is a SEQUENCE of (n, e)
+            _, rsa_seq, _ = _asn1_next(key_bytes, 0)
+            _, n_bytes, _ = _asn1_next(rsa_seq, 0)
+            key_size = (len(n_bytes) - (1 if n_bytes[0] == 0 else 0)) * 8
+            return f"RSA", key_size
+        elif "ec" in alg_name.lower():
+            # ECDSA — size from curve OID
+            _, params, _ = _asn1_next(alg_seq, len(oid_bytes) + 2)
+            curve_oid = _oid_to_str(params) if params else ""
+            curve_name = OID_NAMES.get(curve_oid, curve_oid)
+            bits = 256 if "256" in curve_name else (384 if "384" in curve_name else (521 if "521" in curve_name else 0))
+            return f"ECDSA ({curve_name})", bits
+        return alg_name, 0
+    except Exception:
+        return "Unknown", 0
+
+def _parse_extensions(data):
+    """Parse certificate extensions body, extract SAN."""
+    sans = []
+    try:
+        off = 0
+        while off < len(data):
+            tag, ext_seq, off = _asn1_next(data, off)
+            if tag == 0: break
+            eoff = 0
+            _, oid_bytes, eoff = _asn1_next(ext_seq, eoff)
+            oid = _oid_to_str(oid_bytes)
+            if oid == "2.5.29.17":   # SAN
+                # next may be critical bool, then octet string
+                tag2, val2, eoff2 = _asn1_next(ext_seq, eoff)
+                if tag2 == 0x01:     # boolean (critical flag)
+                    tag2, val2, eoff2 = _asn1_next(ext_seq, eoff2)
+                # val2 is OCTET STRING containing the SAN SEQUENCE
+                _, san_seq, _ = _asn1_next(val2, 0)
+                soff = 0
+                while soff < len(san_seq):
+                    stag, sval, soff = _asn1_next(san_seq, soff)
+                    if stag == 0x82:   # dNSName
+                        try: sans.append(sval.decode("ascii","replace"))
+                        except: pass
+                    elif stag == 0x87 and len(sval) == 4:   # iPAddress v4
+                        try: sans.append(socket.inet_ntoa(sval))
+                        except: pass
+    except Exception:
+        pass
+    return sans
+
+def _parse_certificate(cert_bytes):
+    """
+    Parse a DER-encoded X.509 certificate.
+    Returns dict with subject, issuer, sans, validity, key_type, key_bits.
+    """
+    result = {
+        "subject": "", "issuer": "", "sans": [],
+        "not_before": None, "not_after": None,
+        "key_type": "Unknown", "key_bits": 0,
+        "serial": "",
+    }
+    try:
+        tag, tbs_outer, _ = _asn1_next(cert_bytes, 0)   # Certificate SEQUENCE
+        if tag != 0x30:
+            return result
+        off = 0
+        # TBSCertificate
+        tag2, tbs, off = _asn1_next(tbs_outer, off)
+        # Parse TBSCertificate fields
+        tbs_off = 0
+        # Optional version [0] EXPLICIT
+        tag3, v0, tbs_off = _asn1_next(tbs, tbs_off)
+        if tag3 == 0xA0:   # version
+            tag3, v0, tbs_off = _asn1_next(tbs, tbs_off)
+        # serialNumber INTEGER
+        if tag3 == 0x02:
+            result["serial"] = v0.hex()[:40]
+            tag3, v0, tbs_off = _asn1_next(tbs, tbs_off)
+        # signature AlgorithmIdentifier
+        tag3, v0, tbs_off = _asn1_next(tbs, tbs_off)
+        # issuer Name
+        tag3, issuer_bytes, tbs_off = _asn1_next(tbs, tbs_off)
+        issuer_dn = _parse_dn(issuer_bytes)
+        result["issuer"] = issuer_dn.get("CN","") or issuer_dn.get("O","") or str(issuer_dn)
+        # validity
+        tag3, validity_bytes, tbs_off = _asn1_next(tbs, tbs_off)
+        nb, na = _parse_validity(validity_bytes)
+        result["not_before"] = nb
+        result["not_after"]  = na
+        # subject Name
+        tag3, subject_bytes, tbs_off = _asn1_next(tbs, tbs_off)
+        subject_dn = _parse_dn(subject_bytes)
+        result["subject"] = subject_dn.get("CN","") or subject_dn.get("O","") or str(subject_dn)
+        result["subject_dn"] = subject_dn
+        # SubjectPublicKeyInfo
+        tag3, spki_bytes, tbs_off = _asn1_next(tbs, tbs_off)
+        kt, kb = _parse_pubkey_info(spki_bytes)
+        result["key_type"] = kt
+        result["key_bits"] = kb
+        # Extensions (optional, [3])
+        while tbs_off < len(tbs):
+            tag3, ext_outer, tbs_off = _asn1_next(tbs, tbs_off)
+            if tag3 == 0xA3:    # [3] extensions
+                tag4, exts_seq, _ = _asn1_next(ext_outer, 0)
+                sans = _parse_extensions(exts_seq)
+                result["sans"] = sans
+    except Exception:
+        pass
+    return result
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TLS record parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_tls_records(payload):
+    """
+    Yield TLS records from a raw TCP app_payload.
+    Each record: (content_type, version, data_bytes)
+    content_type: 20=ChangeCipherSpec, 21=Alert, 22=Handshake, 23=AppData
+    """
+    off = 0
+    while off + 5 <= len(payload):
+        ct  = payload[off]
+        ver = struct.unpack(">H", payload[off+1:off+3])[0]
+        ln  = struct.unpack(">H", payload[off+3:off+5])[0]
+        off += 5
+        if ct not in (20, 21, 22, 23):
+            break   # not TLS
+        if off + ln > len(payload):
+            break
+        yield ct, ver, payload[off:off+ln]
+        off += ln
+
+def _parse_client_hello(data):
+    """Parse ClientHello handshake body. Returns dict of extracted fields."""
+    result = {
+        "client_version": 0, "session_id": "",
+        "cipher_suites": [], "sni": "", "alpn": [], "tls13_offered": False,
+    }
+    try:
+        off = 0
+        result["client_version"] = struct.unpack(">H", data[off:off+2])[0]; off += 2
+        off += 32   # random
+        sid_len = data[off]; off += 1
+        result["session_id"] = data[off:off+sid_len].hex(); off += sid_len
+        cs_len = struct.unpack(">H", data[off:off+2])[0]; off += 2
+        for i in range(0, cs_len, 2):
+            cs = struct.unpack(">H", data[off+i:off+i+2])[0]
+            result["cipher_suites"].append(cs)
+        off += cs_len
+        comp_len = data[off]; off += 1
+        off += comp_len   # compression methods
+        if off + 2 > len(data):
+            return result
+        ext_total = struct.unpack(">H", data[off:off+2])[0]; off += 2
+        ext_end = off + ext_total
+        while off + 4 <= ext_end:
+            ext_type = struct.unpack(">H", data[off:off+2])[0]
+            ext_len  = struct.unpack(">H", data[off+2:off+4])[0]
+            ext_data = data[off+4:off+4+ext_len]; off += 4 + ext_len
+            if ext_type == EXT_SNI and len(ext_data) >= 5:
+                sni_list_len = struct.unpack(">H", ext_data[0:2])[0]
+                sni_type = ext_data[2]
+                sni_name_len = struct.unpack(">H", ext_data[3:5])[0]
+                result["sni"] = ext_data[5:5+sni_name_len].decode("ascii","replace")
+            elif ext_type == EXT_ALPN and len(ext_data) >= 4:
+                proto_list_len = struct.unpack(">H", ext_data[0:2])[0]
+                poff = 2
+                while poff < 2 + proto_list_len:
+                    plen = ext_data[poff]; poff += 1
+                    result["alpn"].append(ext_data[poff:poff+plen].decode("ascii","replace"))
+                    poff += plen
+            elif ext_type == EXT_SUPPORTED:
+                # supported_versions — if 0x0304 present, TLS 1.3 is offered
+                vlist_len = ext_data[0] if ext_data else 0
+                for i in range(1, 1+vlist_len, 2):
+                    if ext_data[i:i+2] == b"\x03\x04":
+                        result["tls13_offered"] = True
+    except Exception:
+        pass
+    return result
+
+def _parse_server_hello(data):
+    """Parse ServerHello handshake body."""
+    result = {"server_version": 0, "cipher_suite": 0, "session_id": "", "tls13_negotiated": False}
+    try:
+        off = 0
+        result["server_version"] = struct.unpack(">H", data[off:off+2])[0]; off += 2
+        off += 32   # random
+        sid_len = data[off]; off += 1
+        result["session_id"] = data[off:off+sid_len].hex(); off += sid_len
+        result["cipher_suite"] = struct.unpack(">H", data[off:off+2])[0]; off += 2
+        off += 1   # compression method
+        if off + 2 <= len(data):
+            ext_total = struct.unpack(">H", data[off:off+2])[0]; off += 2
+            ext_end = off + ext_total
+            while off + 4 <= ext_end:
+                ext_type = struct.unpack(">H", data[off:off+2])[0]
+                ext_len  = struct.unpack(">H", data[off+2:off+4])[0]
+                ext_data = data[off+4:off+4+ext_len]; off += 4 + ext_len
+                if ext_type == EXT_SUPPORTED and len(ext_data) == 2:
+                    ver = struct.unpack(">H", ext_data)[0]
+                    if ver == 0x0304:
+                        result["tls13_negotiated"] = True
+                        result["server_version"] = 0x0304
+    except Exception:
+        pass
+    return result
+
+def _parse_certificates(data):
+    """Parse Certificate handshake body. Returns list of parsed cert dicts."""
+    certs = []
+    try:
+        off = 0
+        total_len = struct.unpack(">I", b"\x00" + data[0:3])[0]; off += 3
+        end = min(off + total_len, len(data))
+        while off + 3 <= end:
+            cert_len = struct.unpack(">I", b"\x00" + data[off:off+3])[0]; off += 3
+            cert_bytes = data[off:off+cert_len]; off += cert_len
+            parsed = _parse_certificate(cert_bytes)
+            certs.append(parsed)
+    except Exception:
+        pass
+    return certs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session correlator — main entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_tls_sessions(packets):
+    """
+    Walk all packets, find TLS handshakes, parse them, and return
+    a list of per-session dicts suitable for the Excel sheet.
+
+    Session key: (client_ip, server_ip, server_port)
+    — we use server_port because the client port changes per connection
+      but the server port identifies the service.
+    """
+    # Accumulate handshake fragments per TCP stream
+    # key = (src_ip, dst_ip, sport, dport)  (canonical: lower IP first)
+    streams = defaultdict(bytearray)   # raw payload accumulation
+    sessions = {}    # (client_ip, server_ip, srv_port) -> session dict
+
+    def _skey(p):
+        """Canonical stream key: always client→server direction."""
+        return (p["src_ip"], p["dst_ip"], p["src_port"], p["dst_port"])
+
+    TLS_PORTS = {443, 8443, 4443, 993, 995, 465, 587, 636, 3269, 8883, 5671, 5672}
+
+    for p in packets:
+        proto = p.get("proto","")
+        payload = p.get("app_payload", b"")
+        if not payload or len(payload) < 6:
+            continue
+
+        sp, dp = p.get("src_port",0), p.get("dst_port",0)
+        src, dst = p.get("src_ip",""), p.get("dst_ip","")
+
+        # Only process TCP on TLS ports, OR packets that look like TLS
+        is_tls_port = sp in TLS_PORTS or dp in TLS_PORTS
+        looks_like_tls = (len(payload) >= 5 and
+                          payload[0] in (20,21,22,23) and
+                          payload[1] == 0x03 and
+                          payload[2] in (0x00,0x01,0x02,0x03,0x04))
+        if not (is_tls_port or looks_like_tls):
+            continue
+
+        # Determine session key: client is whoever initiated (higher port usually)
+        if dp in TLS_PORTS or dp < sp:
+            client_ip, server_ip, srv_port = src, dst, dp
+        else:
+            client_ip, server_ip, srv_port = dst, src, sp
+
+        sess_key = (client_ip, server_ip, srv_port)
+        if sess_key not in sessions:
+            sessions[sess_key] = {
+                "client_ip": client_ip,
+                "server_ip": server_ip,
+                "server_port": srv_port,
+                "sni": "",
+                "client_version_offered": "",
+                "tls_version": "",
+                "cipher_suite_id": 0,
+                "cipher_suite": "",
+                "alpn": "",
+                "cert_subject": "",
+                "cert_issuer": "",
+                "cert_sans": "",
+                "cert_not_before": "",
+                "cert_not_after": "",
+                "cert_key_type": "",
+                "cert_key_bits": 0,
+                "cert_expired": False,
+                "cert_expiring_soon": False,
+                "weak_cipher": False,
+                "weak_version": False,
+                "alerts": [],
+                "handshake_complete": False,
+                "issues": [],
+            }
+        sess = sessions[sess_key]
+
+        # Parse TLS records from this packet's payload
+        try:
+            for ct, ver, rec_data in _parse_tls_records(payload):
+                if ct == 22:   # Handshake
+                    hs_off = 0
+                    while hs_off + 4 <= len(rec_data):
+                        hs_type = rec_data[hs_off]
+                        hs_len  = struct.unpack(">I", b"\x00" + rec_data[hs_off+1:hs_off+4])[0]
+                        hs_data = rec_data[hs_off+4:hs_off+4+hs_len]
+                        hs_off += 4 + hs_len
+
+                        if hs_type == 1:   # ClientHello
+                            ch = _parse_client_hello(hs_data)
+                            if not sess["sni"]:
+                                sess["sni"] = ch.get("sni","")
+                            if not sess["client_version_offered"]:
+                                cv = ch.get("client_version",0)
+                                if ch.get("tls13_offered"):
+                                    sess["client_version_offered"] = "TLS 1.3 (offered)"
+                                else:
+                                    sess["client_version_offered"] = TLS_VERSIONS.get(cv, f"0x{cv:04x}")
+                            if not sess["alpn"]:
+                                sess["alpn"] = ", ".join(ch.get("alpn",[]))
+
+                        elif hs_type == 2:   # ServerHello
+                            sh = _parse_server_hello(hs_data)
+                            sv = sh.get("server_version",0)
+                            if sh.get("tls13_negotiated"):
+                                sess["tls_version"] = "TLS 1.3"
+                            else:
+                                sess["tls_version"] = TLS_VERSIONS.get(sv, f"0x{sv:04x}")
+                            cs_id = sh.get("cipher_suite",0)
+                            sess["cipher_suite_id"] = cs_id
+                            sess["cipher_suite"] = CIPHER_SUITES.get(cs_id, f"0x{cs_id:04x}")
+
+                        elif hs_type == 11 and not sess["cert_subject"]:   # Certificate
+                            certs = _parse_certificates(hs_data)
+                            if certs:
+                                leaf = certs[0]
+                                sess["cert_subject"]   = leaf.get("subject","")
+                                sess["cert_issuer"]    = leaf.get("issuer","")
+                                sess["cert_sans"]      = ", ".join(leaf.get("sans",[]))[:200]
+                                sess["cert_key_type"]  = leaf.get("key_type","")
+                                sess["cert_key_bits"]  = leaf.get("key_bits",0)
+                                nb = leaf.get("not_before")
+                                na = leaf.get("not_after")
+                                if nb: sess["cert_not_before"] = nb.strftime("%Y-%m-%d")
+                                if na:
+                                    sess["cert_not_after"] = na.strftime("%Y-%m-%d")
+                                    now = datetime.datetime.utcnow()
+                                    sess["cert_expired"]       = na < now
+                                    sess["cert_expiring_soon"] = (na - now).days < 30 and not sess["cert_expired"]
+
+                        elif hs_type == 20:   # Finished
+                            sess["handshake_complete"] = True
+
+                elif ct == 21 and len(rec_data) >= 2:   # Alert
+                    level = {1:"Warning",2:"Fatal"}.get(rec_data[0],"?")
+                    desc  = ALERT_DESCS.get(rec_data[1], f"code {rec_data[1]}")
+                    alert_str = f"{level}: {desc}"
+                    if alert_str not in sess["alerts"]:
+                        sess["alerts"].append(alert_str)
+
+        except Exception:
+            continue
+
+    # ── Post-process: flag issues ─────────────────────────────────────────────
+    now = datetime.datetime.utcnow()
+    for sess in sessions.values():
+        issues = []
+        cs = sess["cipher_suite"]
+        ver = sess["tls_version"]
+
+        # Weak cipher suite
+        if any(w in cs for w in WEAK_CIPHERS):
+            sess["weak_cipher"] = True
+            issues.append(f"Weak cipher: {cs}")
+
+        # NULL / anon
+        if "NULL" in cs or "anon" in cs.lower():
+            issues.append("NULL or anonymous cipher — no encryption/auth")
+
+        # Weak TLS version
+        if ver in ("SSLv3","TLS 1.0","TLS 1.1"):
+            sess["weak_version"] = True
+            issues.append(f"Deprecated protocol: {ver}")
+
+        # Cert expired
+        if sess["cert_expired"]:
+            issues.append("Certificate EXPIRED")
+
+        # Cert expiring soon
+        if sess["cert_expiring_soon"]:
+            issues.append("Certificate expiring within 30 days")
+
+        # Weak key
+        kt = sess["cert_key_type"]
+        kb = sess["cert_key_bits"]
+        if "RSA" in kt and kb and kb < 2048:
+            issues.append(f"Weak RSA key: {kb}-bit (minimum 2048)")
+        if "RSA" in kt and kb and kb < 4096:
+            if kb < 2048:
+                pass  # already flagged
+        if "ECDSA" in kt and kb and kb < 256:
+            issues.append(f"Weak EC key: {kb}-bit")
+
+        # Alerts
+        for alert in sess["alerts"]:
+            if "Fatal" in alert:
+                issues.append(f"TLS alert — {alert}")
+
+        # No SNI (possible direct IP connection or misconfigured client)
+        if not sess["sni"] and ver and sess["handshake_complete"]:
+            issues.append("No SNI — direct IP or misconfigured client")
+
+        sess["issues"] = issues
+
+    return list(sessions.values())
+
+
+# Test export
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -908,6 +1796,173 @@ def _decode_nbns_name(raw):
         return ""
 
 
+
+def _decode_nbns_payload(payload):
+    """
+    Decode NetBIOS Name Service packets (UDP 137) — both queries and responses.
+    Returns list of human-readable NetBIOS names found, properly decoded from
+    the Level-2 half-ASCII encoding (each byte pair encodes one character).
+    """
+    names = []
+    try:
+        if len(payload) < 12:
+            return names
+        qd_count = struct.unpack(">H", payload[4:6])[0]
+        an_count = struct.unpack(">H", payload[6:8])[0]
+        total    = qd_count + an_count
+        offset   = 12
+        for _ in range(total):
+            if offset >= len(payload):
+                break
+            # Length byte of the encoded name label (should be 0x20 = 32)
+            ln = payload[offset]
+            offset += 1
+            if ln == 0x20 and offset + 32 <= len(payload):
+                raw  = payload[offset:offset+32]
+                name = _decode_nbns_name(raw).strip()
+                if name and name not in ("*", ""):
+                    names.append(name)
+                offset += 32
+                # null terminator
+                if offset < len(payload) and payload[offset] == 0:
+                    offset += 1
+                # skip QTYPE + QCLASS (4 bytes) or RTYPE+RCLASS+TTL+RDLEN (10 bytes)
+                offset += 4
+            else:
+                break
+    except Exception:
+        pass
+    return names
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Traceroute / ICMP TTL-exceeded hop reconstructor
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_traceroutes(packets):
+    """
+    Reconstruct traceroute paths from ICMP TTL-exceeded (type 11) replies.
+
+    A traceroute works by sending probes with increasing TTL values.
+    Each router that drops a packet (TTL=0) sends back an ICMP type 11
+    "Time Exceeded" message.  The inner IP header tells us the original
+    destination; the outer IP source is the hop.
+
+    Returns list of traceroute dicts:
+        {src, dst, hops: [{hop_n, router_ip, rtt_ms}]}
+    """
+    # Collect ICMP type-11 replies: outer_src = router, inner = original probe
+    # We detect them by looking at ICMP packets where proto is ICMP and
+    # the payload starts with an IP header (inner encapsulated packet).
+    hop_events = []   # (origin_src, final_dst, hop_router, approx_ttl_level)
+
+    for p in packets:
+        if p.get("proto") != "ICMP":
+            continue
+        payload = p.get("app_payload", b"")
+        # ICMP header: type(1) code(1) checksum(2) rest(4) = 8 bytes
+        # For type 11 (TTL exceeded), the payload is the original IP header + 8 bytes
+        if len(payload) < 8:
+            continue
+        icmp_type = payload[0]
+        if icmp_type != 11:   # Time Exceeded
+            continue
+        inner = payload[8:]   # original IP packet (at least 20 bytes header)
+        if len(inner) < 20:
+            continue
+        try:
+            inner_ihl  = (inner[0] & 0x0F) * 4
+            inner_src  = socket.inet_ntoa(inner[12:16])
+            inner_dst  = socket.inet_ntoa(inner[16:20])
+            router_ip  = p["src_ip"]   # the router sending the TTL-exceeded back
+            hop_events.append((inner_src, inner_dst, router_ip))
+        except Exception:
+            continue
+
+    if not hop_events:
+        return []
+
+    # Group by (origin → destination) pair
+    paths = defaultdict(list)
+    for origin, dest, router in hop_events:
+        paths[(origin, dest)].append(router)
+
+    traces = []
+    for (origin, dest), routers in paths.items():
+        # Deduplicate while preserving order
+        seen = []
+        for r in routers:
+            if r not in seen:
+                seen.append(r)
+        hops = [{"hop_n": i+1, "router_ip": r} for i, r in enumerate(seen)]
+        traces.append({"src": origin, "dst": dest, "hops": hops})
+
+    return traces
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gateway / router detection from ARP + routing heuristics
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_gateways(packets, nodes):
+    """
+    Identify default gateways by looking at:
+      1. ARP requests sent to the router from each subnet — the router IP
+         is the most-queried ARP target that is NOT a host sending traffic
+      2. Hosts that forward packets for many other subnets (high TTL, many peers)
+
+    Returns dict: {subnet_cidr -> gateway_ip}
+    """
+    # Count ARP targets per subnet
+    arp_targets = defaultdict(lambda: defaultdict(int))  # subnet -> ip -> count
+
+    for p in packets:
+        if p.get("proto") != "ARP":
+            continue
+        src_ip = p.get("src_ip","")
+        dst_ip = p.get("dst_ip","")
+        if not src_ip or not dst_ip:
+            continue
+        try:
+            src_addr = ipaddress.ip_address(src_ip)
+            if not src_addr.is_private:
+                continue
+            net = str(ipaddress.ip_network(src_ip + "/24", strict=False))
+            arp_targets[net][dst_ip] += 1
+        except Exception:
+            continue
+
+    gateways = {}
+    for subnet, targets in arp_targets.items():
+        if not targets:
+            continue
+        # Most ARP'd target that is itself in the same subnet is likely the gateway
+        candidates = sorted(targets.items(), key=lambda x: -x[1])
+        for ip, count in candidates:
+            try:
+                addr = ipaddress.ip_address(ip)
+                if addr.is_private and count >= 2:
+                    gateways[subnet] = ip
+                    break
+            except Exception:
+                continue
+
+    # Fallback: nodes with role "server" or "host" that have the lowest
+    # host octet (e.g. .1) are likely gateways/routers
+    for ip, info in nodes.items():
+        try:
+            addr   = ipaddress.ip_address(ip)
+            subnet = info["subnet"]
+            if subnet == "external" or subnet in gateways:
+                continue
+            if addr.is_private and (addr.packed[-1] in (1, 254)):
+                gateways[subnet] = ip
+        except Exception:
+            continue
+
+    return gateways
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Diagram styles & layout
 # ─────────────────────────────────────────────────────────────────────────────
@@ -935,21 +1990,30 @@ SUBNET_PALETTES = [
     ("#ede7f6","#4527a0"),
 ]
 
-# ── Layout constants — wider spacing to prevent MAC overlap ─────────────────
-NODE_W        = 72
-NODE_H        = 72
-NODE_LABEL_H  = 52    # taller: hostname + IP + MAC
-NODE_GAP_X    = 90    # ← increased from 50 to 90
-NODE_GAP_Y    = 70    # ← increased from 60 to 70
-CONT_PAD      = 50    # ← increased from 40 to 50
-CONT_TITLE    = 34
-CONT_GAP_X    = 70
-CONT_GAP_Y    = 55
-LEGEND_W      = 185
-PAGE_X        = 215
-PAGE_Y        = 80
-NODES_PER_ROW = 4
-CONTS_PER_ROW = 3
+# ── Layout constants ─────────────────────────────────────────────────────────
+# The node is rendered as a Cisco icon (NODE_W × NODE_H) with a text label
+# below it.  draw.io's verticalLabelPosition=bottom places the label OUTSIDE
+# the icon geometry, so we must account for label height in row spacing.
+#
+# STRIDE_X = horizontal distance between node top-left corners
+# STRIDE_Y = vertical distance between node top-left corners
+#          = NODE_H + LABEL_RESERVE + inter-node gap
+NODE_W          = 72    # icon width  (also used as label width)
+NODE_H          = 60    # icon height only — geometry passed to draw.io
+LABEL_RESERVE   = 72    # vertical space reserved for label text (4 lines + padding)
+INTER_GAP_X     = 28    # horizontal gap between adjacent node label areas
+INTER_GAP_Y     = 18    # vertical gap between bottom of one label and top of next icon
+STRIDE_X        = NODE_W + INTER_GAP_X          # 100
+STRIDE_Y        = NODE_H + LABEL_RESERVE + INTER_GAP_Y   # 150
+CONT_PAD        = 44    # padding inside container border
+CONT_TITLE      = 34    # container header height
+CONT_GAP_X      = 60    # gap between container boxes horizontally
+CONT_GAP_Y      = 50    # gap between container boxes vertically
+LEGEND_W        = 185
+PAGE_X          = 215
+PAGE_Y          = 80
+NODES_PER_ROW   = 4
+CONTS_PER_ROW   = 3
 
 
 def layout(nodes):
@@ -982,16 +2046,18 @@ def layout(nodes):
         ncols = min(n, NODES_PER_ROW)
         nrows = math.ceil(n / NODES_PER_ROW)
 
-        cell_h  = NODE_H + NODE_LABEL_H
-        inner_w = ncols * NODE_W + (ncols-1) * NODE_GAP_X
-        inner_h = nrows * cell_h + (nrows-1) * NODE_GAP_Y
-        cw = inner_w + CONT_PAD*2
-        ch = inner_h + CONT_PAD*2 + CONT_TITLE
+        # Inner dimensions: each node occupies STRIDE_X × STRIDE_Y
+        # but the last node in each row/col doesn't need the trailing gap
+        inner_w = ncols * STRIDE_X - INTER_GAP_X
+        inner_h = nrows * STRIDE_Y - INTER_GAP_Y
+        cw = inner_w + CONT_PAD * 2
+        ch = inner_h + CONT_PAD * 2 + CONT_TITLE
 
         for i, ip in enumerate(ips):
             r2, c2 = divmod(i, NODES_PER_ROW)
-            nx = cx + CONT_PAD + c2*(NODE_W+NODE_GAP_X) + NODE_W//2
-            ny = cy + CONT_TITLE + CONT_PAD + r2*(cell_h+NODE_GAP_Y) + NODE_H//2
+            # nx/ny = top-left corner of the icon within the container
+            nx = cx + CONT_PAD + c2 * STRIDE_X
+            ny = cy + CONT_TITLE + CONT_PAD + r2 * STRIDE_Y
             node_pos[ip] = (int(nx), int(ny))
 
         containers.append(dict(subnet=sub, palette_idx=si,
@@ -1026,9 +2092,15 @@ def _geo(cell, x=0, y=0, w=10, h=10, relative=None):
 # draw.io generator
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_drawio(nodes, findings, title="Network Diagram"):
-    """No connector lines — pure host inventory diagram."""
+def generate_drawio(nodes, findings, gateways, traceroutes, title="Network Diagram"):
+    """
+    Host inventory diagram with:
+      - Gateway lines (thin grey, gateways only)
+      - Traceroute section below main diagram
+    """
     node_pos, containers = layout(nodes)
+    # Work out how tall the main diagram area is so we can place traceroute below
+    max_y = max((c["y"] + c["h"] for c in containers), default=PAGE_Y) if containers else PAGE_Y
 
     # Build finding set for quick lookup
     flagged_ips = set()
@@ -1126,12 +2198,169 @@ def generate_drawio(nodes, findings, title="Network Diagram"):
         nc = _cell(g, id=nid, value=label, tooltip=tooltip,
                    style=(f"{shape}fillColor={fill};strokeColor={stroke};"
                           "verticalLabelPosition=bottom;verticalAlign=top;"
-                          "labelPosition=center;align=center;html=1;"),
+                          "labelPosition=center;align=center;"
+                          "labelBackgroundColor=none;labelBorderColor=none;"
+                          "fontSize=9;whiteSpace=wrap;html=1;"),
                    vertex="1", parent=parent)
-        _geo(nc, x=rx-NODE_W//2, y=ry-NODE_H//2, w=NODE_W, h=NODE_H)
+        # Icon geometry: NODE_W × NODE_H only.
+        # The label renders below this box via verticalLabelPosition=bottom.
+        # Row spacing (STRIDE_Y) already reserves LABEL_RESERVE px for it,
+        # so labels never reach the next row's icons.
+        _geo(nc, x=rx, y=ry, w=NODE_W, h=NODE_H)
+
+    # ── Gateway lines: thin grey lines between gateway and every node in subnet ──
+    gw_node_ids = {}   # ip -> id  (for gateways that ARE nodes)
+    for ip, nid_candidate in zip(
+            [ip for ip in nodes],
+            [f"n{ni}" for ni in range(len(nodes))]):
+        if ip in gateways.values():
+            gw_node_ids[ip] = nid_candidate
+
+    # Build reverse lookup: nid for each ip
+    node_id_map = {ip: f"n{ni}" for ni, ip in enumerate(nodes)}
+
+    edge_idx = 0
+    for subnet, gw_ip in gateways.items():
+        if gw_ip not in node_id_map:
+            continue
+        gw_id = node_id_map[gw_ip]
+        # Connect gateway to every other node in the same subnet
+        for ip, info in nodes.items():
+            if ip == gw_ip:
+                continue
+            if info["subnet"] != subnet:
+                continue
+            if ip not in node_id_map:
+                continue
+            ec = _cell(g, id=f"gwe{edge_idx}", value="",
+                       style=("endArrow=none;startArrow=none;"
+                              "strokeColor=#bbbbbb;strokeWidth=1;opacity=50;"
+                              "dashed=1;dashPattern=4 4;"
+                              "rounded=1;html=1;"),
+                       edge="1", source=gw_id, target=node_id_map[ip],
+                       parent="1")
+            ET.SubElement(ec, "mxGeometry", relative="1", **{"as":"geometry"})
+            edge_idx += 1
+
+    # ── Traceroute section ─────────────────────────────────────────────────────
+    if traceroutes:
+        tr_y = max_y + 80   # start below main diagram
+        _draw_traceroute_section(g, traceroutes, node_id_map, tr_y)
 
     raw = ET.tostring(root, encoding="unicode")
     return minidom.parseString(raw).toprettyxml(indent="  ")
+
+
+def _draw_traceroute_section(g, traceroutes, node_id_map, start_y):
+    """
+    Draw traceroute hop chains below the main diagram.
+    Each trace is rendered as a horizontal chain of hop nodes
+    connected by labelled arrows, grouped in a swimlane container.
+    """
+    HOP_W     = 120
+    HOP_H     = 50
+    HOP_GAP   = 60
+    SECT_PAD  = 20
+    SECT_TITLE= 30
+    ROW_H     = HOP_H + SECT_PAD * 2 + SECT_TITLE + 20
+    cy        = int(start_y)
+    SHAPE_ROUTER = "shape=mxgraph.cisco.routers.router;"
+
+    # Section header label
+    hdr = _cell(g, id="tr_hdr",
+                value="<b>&#128246; Traceroute Paths (reconstructed from ICMP TTL-exceeded)</b>",
+                style=("text;html=1;strokeColor=none;fillColor=none;"
+                       "align=left;verticalAlign=middle;fontSize=13;"
+                       "fontColor=#333;fontStyle=1;"),
+                vertex="1", parent="1")
+    _geo(hdr, x=PAGE_X, y=cy, w=900, h=28)
+    cy += 36
+
+    for ti, trace in enumerate(traceroutes):
+        hops     = trace["hops"]
+        n_hops   = len(hops)
+        if n_hops == 0:
+            continue
+
+        src_label = trace.get("src_hostname") or trace["src"]
+        dst_label = trace.get("dst_hostname") or trace["dst"]
+        title_lbl = (f"<b>Trace {ti+1}:</b>  {src_label}  →  {dst_label}  "
+                     f"<font style='font-size:9px;color:#666;'>({n_hops} hop{"s" if n_hops!=1 else ""})</font>")
+
+        # Container width: origin + hops + destination
+        total_nodes = 1 + n_hops + 1
+        cw = SECT_PAD * 2 + total_nodes * HOP_W + (total_nodes - 1) * HOP_GAP
+        ch = SECT_TITLE + SECT_PAD * 2 + HOP_H
+
+        cid = f"tr_cont_{ti}"
+        cc = _cell(g, id=cid, value=title_lbl,
+                   style=(f"swimlane;startSize={SECT_TITLE};"
+                          "fillColor=#f0f4f8;strokeColor=#607d8b;"
+                          "fontColor=#37474f;fontSize=10;"
+                          "fontStyle=0;rounded=1;arcSize=3;html=1;"),
+                   vertex="1", parent="1")
+        _geo(cc, x=PAGE_X, y=cy, w=cw, h=ch)
+
+        # Helper: draw a hop node inside the container
+        def hop_node(node_id, col_idx, label, shape, fill, stroke, tooltip=""):
+            nx = SECT_PAD + col_idx * (HOP_W + HOP_GAP)
+            ny = SECT_TITLE + SECT_PAD
+            nc = _cell(g, id=node_id, value=label, tooltip=tooltip,
+                       style=(f"{shape}fillColor={fill};strokeColor={stroke};"
+                              "verticalLabelPosition=bottom;verticalAlign=top;"
+                              "labelPosition=center;align=center;fontSize=9;html=1;"),
+                       vertex="1", parent=cid)
+            _geo(nc, x=nx, y=ny, w=HOP_W, h=HOP_H)
+            return node_id
+
+        # Helper: draw an arrow between two hop nodes
+        def hop_edge(eid, src_id, tgt_id, lbl=""):
+            ec = _cell(g, id=eid, value=lbl,
+                       style=("endArrow=block;endFill=1;"
+                              "strokeColor=#607d8b;strokeWidth=1.5;"
+                              "fontSize=8;fontColor=#607d8b;"
+                              "rounded=1;html=1;"),
+                       edge="1", source=src_id, target=tgt_id,
+                       parent=cid)
+            ET.SubElement(ec, "mxGeometry", relative="1", **{"as":"geometry"})
+
+        # Origin node (the client that ran the trace)
+        origin_id = f"tr{ti}_origin"
+        origin_lbl = (f"<b>{src_label}</b><br/>"
+                      f"<font style='font-size:8px;color:#555;'>{trace['src']}</font>")
+        hop_node(origin_id, 0, origin_lbl,
+                 "shape=mxgraph.cisco.computers_and_peripherals.pc;",
+                 "#fff2cc","#d6b656", f"Traceroute origin: {trace['src']}")
+
+        prev_id = origin_id
+        for hi, hop in enumerate(hops):
+            hop_ip  = hop["router_ip"]
+            hop_hn  = hop.get("hostname", "")
+            hop_lbl = (f"<b>Hop {hop['hop_n']}</b><br/>"
+                       f"<font style='font-size:8px;'>{hop_hn or hop_ip}</font><br/>"
+                       f"<font style='font-size:7px;color:#888;'>{hop_ip if hop_hn else ''}</font>")
+            nid = f"tr{ti}_hop{hi}"
+            # Check if this hop IP is a known node — if so link style differs
+            is_known = hop_ip in node_id_map
+            fill   = "#dae8fc" if is_known else "#f5f5f5"
+            stroke = "#6c8ebf" if is_known else "#aaaaaa"
+            known_note = "\nKnown node in diagram" if is_known else ""
+            hop_node(nid, hi+1, hop_lbl, SHAPE_ROUTER, fill, stroke,
+                     tooltip=f"Router hop {hop['hop_n']}: {hop_ip}{known_note}")
+            hop_edge(f"tr{ti}_e{hi}", prev_id, nid)
+            prev_id = nid
+
+        # Destination node
+        dst_id  = f"tr{ti}_dst"
+        dst_lbl = (f"<b>{dst_label}</b><br/>"
+                   f"<font style='font-size:8px;color:#555;'>{trace['dst']}</font>")
+        hop_node(dst_id, n_hops+1, dst_lbl,
+                 "shape=mxgraph.cisco.storage.cloud;",
+                 "#ffe6cc","#d79b00", f"Trace destination: {trace['dst']}")
+        hop_edge(f"tr{ti}_efinal", prev_id, dst_id, "")
+
+        cy += ch + 16   # gap between traces
+
 
 
 def _add_legend(g, findings):
@@ -1192,7 +2421,7 @@ def _add_legend(g, findings):
 # Excel export
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, output_path):
+def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls_sessions, output_path):
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -1482,6 +2711,279 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, output_path):
     ws6.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
 
 
+
+    # ── Sheet 7: Banner & Resource Intelligence ───────────────────────────────
+    ws7 = wb.create_sheet("Banner Intel")
+
+    # Sub-section colours
+    CAT_COLOURS = {
+        "Banner":          ("1A3A5C", "FFFFFF"),   # dark navy
+        "Resource":        ("1A5C2E", "FFFFFF"),   # dark green
+        "Client Software": ("5C3A1A", "FFFFFF"),   # dark brown
+    }
+
+    # Build structured sections: Banners, then Resources, then Client Software
+    def _banner_sort(h):
+        cat_order = {"Banner":0, "Resource":1, "Client Software":2}
+        return (cat_order.get(h["category"], 9), h["protocol"], h["server_ip"])
+
+    banner_hits_sorted = sorted(banner_hits, key=_banner_sort)
+
+    HDR7 = ["Category", "Banner / Resource Type", "Server / Host IP",
+            "Client IP", "Port", "Protocol", "Value / Detail", "Context"]
+    apply_hdr(ws7, HDR7, "1A3A5C")
+    ws7.freeze_panes = "A2"
+
+    BANNER_TYPE_NOTE = {
+        "HTTP Server Header":   "⚠ Version disclosure — update server header suppression",
+        "X-Powered-By":         "⚠ Technology disclosure — remove in production",
+        "X-Generator":          "⚠ CMS/framework version disclosed",
+        "ASP.NET Version":      "⚠ .NET version disclosure — disable X-AspNet-Version header",
+        "Via (Proxy)":          "ℹ Proxy/load balancer in path",
+        "FTP Banner":           "⚠ Server version in banner — consider suppressing",
+        "SMTP Banner":          "⚠ Mail server version disclosed in greeting",
+        "SSH Version String":   "⚠ SSH version disclosed — consider 'DebianBanner no'",
+        "Telnet Version String":"⚠ Device version in Telnet banner",
+        "Telnet Login Banner":  "ℹ Login banner content",
+        "SNMP sysDescr":        "⚠ OS/device info in SNMP — consider restricting access",
+        "DHCP Vendor Class":    "ℹ Client identifies itself to DHCP server",
+        "Runtime Version":      "⚠ Runtime version disclosure",
+        "HTTP Request":         "ℹ Commonly requested resource",
+        "HTTP User-Agent":      "ℹ Client software / OS fingerprint",
+        "DNS Query":            "ℹ Domain being resolved",
+        "NTP Server":           "ℹ NTP time source",
+        "DHCP Server":          "ℹ DHCP server identity",
+        "SMTP EHLO Domain":     "ℹ Client mail domain",
+    }
+
+    # De-duplicate banner_hits (already done inside extract_banners, but wb sheet needs it)
+    seen_b = set()
+    deduped_b = []
+    for h in banner_hits_sorted:
+        key = (h["category"], h["banner_type"], h["server_ip"], h["value"])
+        if key not in seen_b:
+            seen_b.add(key)
+            deduped_b.append(h)
+
+    if not deduped_b:
+        ws7.cell(row=2, column=1, value="No banners or notable resources detected.")
+    else:
+        current_cat = None
+        data_row = 2
+
+        for h in deduped_b:
+            cat = h["category"]
+
+            # Insert a category divider row when the category changes
+            if cat != current_cat:
+                current_cat = cat
+                bg_hex, fg_hex = CAT_COLOURS.get(cat, ("444444","FFFFFF"))
+                div_cell = ws7.cell(row=data_row, column=1,
+                                    value=f"── {cat.upper()} ──")
+                div_cell.font  = Font(name="Arial", bold=True, size=10, color=fg_hex)
+                div_cell.fill  = PatternFill("solid", fgColor=bg_hex)
+                div_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+                div_cell.border = bdr
+                # Merge across all columns for the divider
+                ws7.merge_cells(start_row=data_row, start_column=1,
+                                end_row=data_row, end_column=8)
+                ws7.row_dimensions[data_row].height = 18
+                data_row += 1
+
+            ws7.row_dimensions[data_row].height = 22
+            note = BANNER_TYPE_NOTE.get(h["banner_type"], "")
+            vals = [
+                h["category"],
+                h["banner_type"],
+                h["server_ip"],
+                h["client_ip"],
+                h["port"] or "",
+                h["protocol"],
+                h["value"],
+                note or h.get("context",""),
+            ]
+            for ci, v in enumerate(vals, 1):
+                c = body_cell(ws7, data_row, ci, v, (data_row % 2 == 0),
+                              centre=(ci in (1,5,6)))
+                c.alignment = Alignment(
+                    horizontal="center" if ci in (1,5,6) else "left",
+                    vertical="center", wrap_text=(ci in (7,8)))
+                # Colour-code the Category column
+                if ci == 1:
+                    bg_hex, fg_hex = CAT_COLOURS.get(cat, ("444444","FFFFFF"))
+                    c.font  = Font(name="Arial", size=9, bold=True, color=fg_hex)
+                    c.fill  = PatternFill("solid", fgColor=bg_hex)
+                    c.border = bdr
+                # Highlight ⚠ notes in the Context column
+                if ci == 8 and str(v).startswith("⚠"):
+                    c.font = Font(name="Arial", size=9, color="B85450", bold=True)
+
+            data_row += 1
+
+    col_w(ws7, [16, 26, 16, 16, 7, 12, 55, 48])
+
+    # Summary header at top
+    ws7.insert_rows(1)
+    ws7.row_dimensions[1].height = 36
+    n_banners   = sum(1 for h in deduped_b if h["category"] == "Banner")
+    n_resources = sum(1 for h in deduped_b if h["category"] == "Resource")
+    n_clients   = sum(1 for h in deduped_b if h["category"] == "Client Software")
+    summ = ws7.cell(row=1, column=1,
+        value=(f"BANNER & RESOURCE INTELLIGENCE  |  "
+               f"Service Banners: {n_banners}   "
+               f"Resources / Queries: {n_resources}   "
+               f"Client Software: {n_clients}"))
+    summ.font  = Font(name="Arial", bold=True, size=11, color="FFFFFF")
+    summ.fill  = PatternFill("solid", fgColor="1A3A5C")
+    summ.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws7.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
+
+
+
+    # ── Sheet 8: TLS Session Analysis ────────────────────────────────────────
+    ws8 = wb.create_sheet("TLS Sessions")
+
+    HDR8 = [
+        "Risk",
+        "Client IP", "Server IP", "Port",
+        "SNI / Hostname", "ALPN",
+        "TLS Version (Negotiated)", "Cipher Suite",
+        "Cert Subject", "Cert Issuer", "SANs",
+        "Cert Valid From", "Cert Expiry",
+        "Key Type", "Key Bits",
+        "Handshake Complete", "Alerts",
+        "Issues / Findings",
+    ]
+    apply_hdr(ws8, HDR8, "1B3A5C")
+    ws8.freeze_panes = "A2"
+    ws8.row_dimensions[1].height = 36
+
+    # Severity helpers
+    def _tls_risk(sess):
+        if sess.get("cert_expired"):        return "CRITICAL"
+        if sess.get("weak_cipher"):         return "HIGH"
+        if sess.get("weak_version"):        return "HIGH"
+        if sess.get("cert_expiring_soon"):  return "MEDIUM"
+        if sess.get("issues"):              return "MEDIUM"
+        if not sess.get("tls_version"):     return "INFO"
+        return "OK"
+
+    TLS_RISK_CLR = {
+        "CRITICAL": ("C00000", "FFFFFF"),
+        "HIGH":     ("C55A11", "FFFFFF"),
+        "MEDIUM":   ("BF8F00", "000000"),
+        "INFO":     ("595959", "FFFFFF"),
+        "OK":       ("375623", "FFFFFF"),
+    }
+
+    # Sort: worst issues first, then by server IP
+    def _tls_sort(s):
+        order = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"INFO":3,"OK":4}
+        return (order.get(_tls_risk(s), 9), s["server_ip"], s["server_port"])
+
+    tls_sorted = sorted(tls_sessions, key=_tls_sort)
+
+    if not tls_sorted:
+        ws8.cell(row=2, column=1,
+                 value="No TLS handshakes detected in capture — only encrypted app-data seen, or no TLS traffic present.")
+    else:
+        for ri, sess in enumerate(tls_sorted, 2):
+            ws8.row_dimensions[ri].height = 22
+            alt = (ri % 2 == 0)
+            risk = _tls_risk(sess)
+            risk_bg, risk_fg = TLS_RISK_CLR.get(risk, ("FFFFFF","000000"))
+
+            cs = sess.get("cipher_suite","")
+            ver = sess.get("tls_version","")
+            expiry = sess.get("cert_not_after","")
+
+            issues_str = "; ".join(sess.get("issues",[])) if sess.get("issues") else ""
+            alerts_str = "; ".join(sess.get("alerts",[])) if sess.get("alerts") else ""
+
+            vals = [
+                risk,
+                sess["client_ip"],
+                sess["server_ip"],
+                sess["server_port"] or "",
+                sess.get("sni",""),
+                sess.get("alpn",""),
+                ver,
+                cs,
+                sess.get("cert_subject",""),
+                sess.get("cert_issuer",""),
+                sess.get("cert_sans",""),
+                sess.get("cert_not_before",""),
+                expiry,
+                sess.get("cert_key_type",""),
+                sess.get("cert_key_bits","") or "",
+                "Yes" if sess.get("handshake_complete") else "Partial",
+                alerts_str,
+                issues_str,
+            ]
+
+            for ci, v in enumerate(vals, 1):
+                centre_cols = {1, 4, 6, 7, 14, 15, 16}
+                c = body_cell(ws8, ri, ci, v, alt, centre=(ci in centre_cols))
+                c.alignment = Alignment(
+                    horizontal="center" if ci in centre_cols else "left",
+                    vertical="center",
+                    wrap_text=(ci in {8, 11, 18}),
+                )
+
+                # Risk column — colour-coded badge
+                if ci == 1:
+                    c.font  = Font(name="Arial", bold=True, size=9, color=risk_fg)
+                    c.fill  = PatternFill("solid", fgColor=risk_bg)
+                    c.border = bdr
+
+                # TLS version — red if deprecated
+                elif ci == 7 and ver in ("SSLv3","TLS 1.0","TLS 1.1"):
+                    c.font = Font(name="Arial", size=9, bold=True, color="C00000")
+
+                # Cipher suite — orange if weak
+                elif ci == 8 and sess.get("weak_cipher"):
+                    c.font = Font(name="Arial", size=9, bold=True, color="C55A11")
+
+                # Cert expiry — red if expired, amber if soon
+                elif ci == 13:
+                    if sess.get("cert_expired"):
+                        c.font = Font(name="Arial", size=9, bold=True, color="C00000")
+                    elif sess.get("cert_expiring_soon"):
+                        c.font = Font(name="Arial", size=9, bold=True, color="BF8F00")
+
+                # Key bits — red if weak
+                elif ci == 15 and isinstance(v, int):
+                    kt = sess.get("cert_key_type","")
+                    if ("RSA" in kt and v and v < 2048) or ("ECDSA" in kt and v and v < 256):
+                        c.font = Font(name="Arial", size=9, bold=True, color="C00000")
+
+                # Issues — bold red if non-empty
+                elif ci == 18 and v:
+                    c.font = Font(name="Arial", size=9, bold=True, color="8B0000")
+
+    col_w(ws8, [10, 15, 15, 6, 28, 10, 14, 38, 28, 28, 32, 13, 13, 14, 8, 10, 28, 48])
+
+    # Summary banner at top
+    ws8.insert_rows(1)
+    ws8.row_dimensions[1].height = 36
+    n_ok       = sum(1 for s in tls_sessions if _tls_risk(s) == "OK")
+    n_critical = sum(1 for s in tls_sessions if _tls_risk(s) == "CRITICAL")
+    n_high     = sum(1 for s in tls_sessions if _tls_risk(s) == "HIGH")
+    n_medium   = sum(1 for s in tls_sessions if _tls_risk(s) == "MEDIUM")
+    n_info     = sum(1 for s in tls_sessions if _tls_risk(s) == "INFO")
+    tls_summ = ws8.cell(row=1, column=1,
+        value=(f"TLS SESSION ANALYSIS  |  Total: {len(tls_sessions)}   "
+               f"✓ OK: {n_ok}   "
+               f"⚠ MEDIUM: {n_medium}   "
+               f"▲ HIGH: {n_high}   "
+               f"✖ CRITICAL: {n_critical}   "
+               f"ℹ Info only: {n_info}"))
+    tls_summ.font  = Font(name="Arial", bold=True, size=11, color="FFFFFF")
+    tls_summ.fill  = PatternFill("solid", fgColor="1B3A5C")
+    tls_summ.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws8.merge_cells(start_row=1, start_column=1, end_row=1, end_column=18)
+
+
     wb.save(output_path)
     return True
 
@@ -1530,15 +3032,50 @@ def main():
           f"{sum(1 for f in findings if f['severity']=='HIGH')} HIGH  "
           f"{sum(1 for f in findings if f['severity']=='MEDIUM')} MEDIUM)")
 
-    xml = generate_drawio(nodes, findings, title=args.title)
+    # Gateway detection
+    gateways = detect_gateways(packets, nodes)
+    print(f"[*] {len(gateways)} gateway(s) detected: " +
+          ", ".join(f"{s}→{ip}" for s,ip in gateways.items()) if gateways else "[*] No gateways detected")
+
+    # Traceroute reconstruction
+    traceroutes = extract_traceroutes(packets)
+    # Enrich hop hostnames from resolved node names
+    passive_hn = resolve_hostnames_from_packets(packets)
+    all_hn = {**passive_hn, **extra_hn}
+    for tr in traceroutes:
+        tr["src_hostname"] = all_hn.get(tr["src"], "")
+        tr["dst_hostname"] = all_hn.get(tr["dst"], "")
+        for hop in tr["hops"]:
+            hop["hostname"] = all_hn.get(hop["router_ip"], "")
+    if traceroutes:
+        print(f"[*] {len(traceroutes)} traceroute path(s) reconstructed")
+        for tr in traceroutes:
+            hops_str = " → ".join(h["hostname"] or h["router_ip"] for h in tr["hops"])
+            print(f"    {tr['src']} → [{hops_str}] → {tr['dst']}")
+
+    # Banner / resource extraction
+    banner_hits = extract_banners(packets)
+    dns_hits    = [b for b in banner_hits if b["banner_type"] == "DNS Query"]
+    svc_banners = [b for b in banner_hits if b["category"] == "Banner"]
+    resources   = [b for b in banner_hits if b["category"] == "Resource" and b["banner_type"] != "DNS Query"]
+    print(f"[*] {len(svc_banners)} service banners · {len(resources)} resources · {len(dns_hits)} DNS queries")
+
+    # TLS handshake analysis
+    tls_sessions = extract_tls_sessions(packets)
+    n_tls_issues = sum(1 for s in tls_sessions if s.get("issues"))
+    print(f"[*] {len(tls_sessions)} TLS session(s) reconstructed  "
+          f"({n_tls_issues} with issues)")
+
+    xml = generate_drawio(nodes, findings, gateways, traceroutes, title=args.title)
     with open(out_dio,"w",encoding="utf-8") as f:
         f.write(xml)
     print(f"[+] Diagram  → {out_dio}")
 
-    ok = generate_xlsx(rows, nodes, edges, findings, cleartext_hits, out_xl)
+    ok = generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls_sessions, out_xl)
     if ok:
-        print(f"[+] Workbook → {out_xl}  (5 sheets: Connections, Node Summary, "
-              f"Pentest Findings, Protocol Summary, Port Inventory, Cleartext Intercepts)")
+        print(f"[+] Workbook → {out_xl}  (8 sheets: Connections, Node Summary, "
+              f"Pentest Findings, Protocol Summary, Port Inventory, "
+              f"Cleartext Intercepts, Banner Intel, TLS Sessions)")
 
     print()
     print("  draw.io: File → Import From → Device → .drawio file")
