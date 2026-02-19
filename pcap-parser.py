@@ -431,18 +431,93 @@ def extract_cleartext(pkt):
 
     # ── NetBIOS — decode Level-2 half-ASCII encoding ──────────────────────
     if proto == "NetBIOS":
-        # Try Level-2 decode first (NBNS registration packets)
+        # NetBIOS suffix byte meanings (RFC 1001/1002)
+        _NB_SUFFIX = {
+            0x00: "Workstation",  0x03: "Messenger",
+            0x06: "RAS Server",   0x1B: "Domain Master Browser",
+            0x1C: "Domain Controllers", 0x1D: "Local Master Browser",
+            0x1E: "Browser Election",   0x20: "File Server",
+            0x21: "RAS Client",
+        }
+
+        def _decode_nbt_encoded(s):
+            """
+            Decode a Level-2 NetBIOS half-ASCII encoded name (A-P chars).
+            Returns (name_str, suffix_description) or (None, None) if not valid.
+            Each pair of A-P bytes encodes one byte: ((A-0x41)<<4)|(B-0x41).
+            Name is 15 chars + 1 suffix byte = 32 encoded chars (16 pairs).
+            """
+            b = s if isinstance(s, (bytes, bytearray)) else s.encode('ascii','replace')
+            # Must be even length, all bytes 0x41-0x50 (A-P)
+            if len(b) < 4 or len(b) % 2 != 0:
+                return None, None
+            if not all(0x41 <= x <= 0x50 for x in b[:32]):
+                return None, None
+            chars = []
+            for i in range(0, min(len(b), 32), 2):
+                c = ((b[i] - 0x41) << 4) | (b[i+1] - 0x41)
+                chars.append(c)
+            if len(chars) >= 16:
+                suffix = chars[15]
+                name = ''.join(chr(c) for c in chars[:15]
+                               if 0x20 <= c < 0x7f).rstrip()
+                suf_desc = _NB_SUFFIX.get(suffix, f"type-{suffix:#04x}")
+            else:
+                suffix = None
+                name = ''.join(chr(c) for c in chars
+                               if 0x20 <= c < 0x7f).rstrip()
+                suf_desc = None
+            # Filter out all-space, wildcard, and empty names
+            if not name or name in ("*", "__") or name.isspace():
+                return None, None
+            return name, suf_desc
+
+        seen_names = set()
+        # Try NBNS wire-format decode first (UDP 137 registrations/responses)
         decoded_names = _decode_nbns_payload(payload)
-        if decoded_names:
-            for name in decoded_names:
+        for name in decoded_names:
+            if name not in seen_names:
+                seen_names.add(name)
                 hit("NetBIOS Name", name, f"{src_ip} -> {dst_ip}")
-        else:
-            # Fallback: grab printable runs from SMB/NetBIOS session traffic
-            runs = _re.findall(rb"[\x20-\x7e]{4,}", payload)
-            for run in runs[:3]:
-                s = run.decode("ascii","replace").strip()
-                if s and not all(c == "\x00" for c in s):
-                    hit("NetBIOS Session Data", s, f"{src_ip} -> {dst_ip}")
+
+        # Scan payload for 32-char (full) or shorter A-P runs = NBT session names
+        # These appear in NBT Session Request packets (TCP 139) and SMB negotiations
+        for run in _re.findall(rb"[A-Pa-p]{16,34}", payload):
+            run_s = run.decode('ascii').upper()
+            # Only attempt if run length is plausibly a name (even length, 16-32 chars)
+            if len(run_s) % 2 != 0:
+                run_s = run_s[:len(run_s)-1]  # trim to even
+            name, suf = _decode_nbt_encoded(run_s)
+            if name and name not in seen_names and name not in ("WORKGROUP",):
+                seen_names.add(name)
+                ctx = f"{src_ip} -> {dst_ip}"
+                if suf:
+                    ctx += f" [{suf}]"
+                hit("NetBIOS Hostname", name, ctx)
+
+        # Also capture workgroup / domain names (they ARE useful intel)
+        for run in _re.findall(rb"[A-Pa-p]{16,34}", payload):
+            run_s = run.decode('ascii').upper()
+            if len(run_s) % 2 != 0:
+                run_s = run_s[:len(run_s)-1]
+            name, suf = _decode_nbt_encoded(run_s)
+            if name == "WORKGROUP" and name not in seen_names:
+                seen_names.add(name)
+                hit("NetBIOS Domain/Workgroup", name, f"{src_ip} -> {dst_ip}")
+
+        # If nothing decoded, capture meaningful SMB strings (not raw encoded garbage)
+        if not seen_names:
+            # Only grab runs that look like real text (contain letters + digits/symbols)
+            # and are NOT all A-P chars (which would be undecodeable garbage)
+            for run in _re.findall(rb"[\x20-\x7e]{6,}", payload):
+                s_str = run.decode("ascii", "replace").strip()
+                if (s_str
+                        and not all(0x41 <= ord(c) <= 0x50 for c in s_str if c.isalpha())
+                        and any(c.isalnum() for c in s_str)
+                        and "SMB" not in s_str[:4]):
+                    hit("NetBIOS Session Data", s_str[:120],
+                        f"{src_ip} -> {dst_ip}")
+                    break  # one is enough
 
     # ── Generic API key / secret patterns (any cleartext protocol) ─────────
     if proto in CLEARTEXT_PROTOS and text:
@@ -3224,6 +3299,10 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls
         for ci, w in enumerate(widths, 1):
             ws.column_dimensions[get_column_letter(ci)].width = w
 
+    def add_autofilter(ws, ncols, hdr_row=1):
+        """Add Excel AutoFilter drop-downs to the header row."""
+        ws.auto_filter.ref = f"A{hdr_row}:{get_column_letter(ncols)}{hdr_row}"
+
     # ── Sheet 1: Connections ──────────────────────────────────────────────────
     ws1 = wb.active; ws1.title = "Connections"
     HDR1 = ["Hostname (src)","MAC Address (src)","Source IP",
@@ -3232,6 +3311,7 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls
             "Assessed Server Role","Packets"]
     apply_hdr(ws1, HDR1)
     ws1.freeze_panes = "A2"
+    add_autofilter(ws1, len(HDR1))
 
     def hn(ip):  return nodes.get(ip,{}).get("hostname","")
     def fm(ip):
@@ -3267,6 +3347,7 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls
             "Pentest Flags","Packet Count","Bytes"]
     apply_hdr(ws2, HDR2, "1F4E79")
     ws2.freeze_panes = "A2"
+    add_autofilter(ws2, len(HDR2))
 
     def node_sort(item):
         ip, info = item
@@ -3306,6 +3387,7 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls
     HDR3 = ["Severity","Category","Source","Destination","Detail","Recommendation"]
     apply_hdr(ws3, HDR3, "8B0000")
     ws3.freeze_panes = "A2"
+    add_autofilter(ws3, len(HDR3))
 
     SEV_COLOURS = {"CRITICAL":"FF0000","HIGH":"FF6600",
                    "MEDIUM":"FFB300","LOW":"00AA00","INFO":"888888"}
@@ -3335,6 +3417,7 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls
             "Cleartext?","Lateral Movement Risk?"]
     apply_hdr(ws4, HDR4, "1F4E79")
     ws4.freeze_panes = "A2"
+    add_autofilter(ws4, len(HDR4))
 
     proto_stats = defaultdict(lambda: dict(count=0, srcs=set(), dsts=set()))
     for (src_ip,dst_ip,proto,port,smac,dmac), info in agg.items():
@@ -3363,6 +3446,7 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls
             "Passive Open Ports","Well-Known Service Names","Suspicious Ports"]
     apply_hdr(ws5, HDR5, "1F4E79")
     ws5.freeze_panes = "A2"
+    add_autofilter(ws5, len(HDR5))
 
     for ri, (ip, info) in enumerate(sorted(nodes.items(), key=node_sort), 2):
         ports    = sorted(info["open_ports"])
@@ -3389,6 +3473,7 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls
             "Source IP","Destination IP","Src Port","Dst Port"]
     apply_hdr(ws6, HDR6, "4A0000")
     ws6.freeze_panes = "A2"
+    add_autofilter(ws6, len(HDR6))
 
     # De-duplicate: same (proto, type, value, src, dst) seen in multiple packets
     seen_ct = set()
@@ -3489,6 +3574,7 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls
             "Client IP", "Port", "Protocol", "Value / Detail", "Context"]
     apply_hdr(ws7, HDR7, "1A3A5C")
     ws7.freeze_panes = "A2"
+    add_autofilter(ws7, len(HDR7))
 
     BANNER_TYPE_NOTE = {
         "HTTP Server Header":   "⚠ Version disclosure — update server header suppression",
@@ -3612,6 +3698,7 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls
     ]
     apply_hdr(ws8, HDR8, "1B3A5C")
     ws8.freeze_panes = "A2"
+    add_autofilter(ws8, len(HDR8))
     ws8.row_dimensions[1].height = 36
 
     # Severity helpers
@@ -3749,6 +3836,7 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls
             "TTL (s)","Response Code","Flags"]
     apply_hdr(ws9, HDR9, "1A4A1A")
     ws9.freeze_panes = "A2"
+    add_autofilter(ws9, len(HDR9))
 
     RTYPE_CLR = {"A":"D9F0D3","AAAA":"C6E2FF","CNAME":"FFF2CC",
                  "PTR":"FFE0CC","MX":"F0D9F0","TXT":"F0F0F0",
@@ -3848,6 +3936,7 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls
                   "WPS","Beacons","Probe Resp","Associated Clients","Notes"]
         apply_hdr(ws10, HDR_AP, "1B2A5C")
         ws10.freeze_panes = "A2"
+        add_autofilter(ws10, len(HDR_AP))
 
         ENC_CLR = {"Open":"C00000","WPA":"C55A11","WPA2":"375623",
                    "WPA3":"1F7A1F","WPA2+FT":"375623"}
