@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-# created 18-02-2026
-# pcap to XLS
-# network recon
 """
 pcap_to_drawio.py  v4.0  — Pentester Edition
 ----------------------------------------------
@@ -164,6 +161,19 @@ def _mac(b):
 def _dissect(raw, ltype, ts_us=0):
     try:
         smac = dmac = "ff:ff:ff:ff:ff:ff"
+
+        # ── 802.11 / Wi-Fi link types ─────────────────────────────────────
+        # ltype 127 = LINKTYPE_IEEE802_11_RADIOTAP
+        # ltype 105 = LINKTYPE_IEEE802_11 (raw, no radiotap)
+        if ltype in (105, 127):
+            # Return a synthetic "wifi" packet that extract_wifi_events can read
+            return dict(src_ip="", dst_ip="", src_mac="", dst_mac="",
+                        src_port=0, dst_port=0, proto="WiFi-802.11",
+                        length=len(raw), resource="", ttl=None, ts_us=ts_us,
+                        win_size=0, app_payload=b"",
+                        arp_sender_mac=None, arp_sender_ip=None,
+                        _raw_frame=raw, _wifi=True)
+
         if ltype == 1:
             if len(raw) < 14: return None
             dmac  = _mac(raw[0:6])
@@ -189,6 +199,7 @@ def _dissect(raw, ltype, ts_us=0):
         if r:
             r["src_mac"] = smac
             r["dst_mac"] = dmac
+            r["_raw_frame"] = raw   # store for WiFi correlation if needed
         return r
     except Exception:
         return None
@@ -1307,7 +1318,8 @@ def extract_tls_sessions(packets):
                 issues.append(f"TLS alert — {alert}")
 
         # No SNI (possible direct IP connection or misconfigured client)
-        if not sess["sni"] and ver and sess["handshake_complete"]:
+        # Trigger if: negotiated TLS version known (ServerHello seen) and no SNI
+        if not sess["sni"] and ver and (sess["handshake_complete"] or sess.get("cipher_suite")):
             issues.append("No SNI — direct IP or misconfigured client")
 
         sess["issues"] = issues
@@ -1316,6 +1328,303 @@ def extract_tls_sessions(packets):
 
 
 # Test export
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 802.11 Wi-Fi frame parser — SSIDs, clients, APs, probe requests
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_wifi_events(packets):
+    """
+    Parse 802.11 management frames (link-type 127 = RADIOTAP, or raw 802.11).
+    Extracts:
+      • Beacon frames      → AP BSSID, SSID, channel, capabilities, rates
+      • Probe Requests     → client MAC, requested SSID (or wildcard)
+      • Probe Responses    → AP BSSID, SSID, responding to client
+      • Association Req/Resp → client↔AP association
+      • Deauthentication   → reason code (useful: detect deauth attacks)
+      • Authentication     → open/shared key sequence
+
+    Returns dict with keys:
+      "aps"      → list of AP dicts  {bssid, ssid, channel, enc, rates, clients}
+      "clients"  → list of client dicts  {mac, probed_ssids, associated_bssid}
+      "events"   → list of event dicts   {type, src_mac, dst_mac, bssid, ssid, ...}
+    """
+    # Frame type/subtype constants
+    MGMT   = 0x00
+    SUBTYPE = {
+        0x00: "Association Request",
+        0x01: "Association Response",
+        0x02: "Reassociation Request",
+        0x03: "Reassociation Response",
+        0x04: "Probe Request",
+        0x05: "Probe Response",
+        0x08: "Beacon",
+        0x0A: "Disassociation",
+        0x0B: "Authentication",
+        0x0C: "Deauthentication",
+    }
+
+    DEAUTH_REASONS = {
+        1: "Unspecified", 2: "Previous auth no longer valid",
+        3: "Leaving BSS", 4: "Inactivity", 5: "AP overloaded",
+        6: "Class 2 frame from non-auth STA",
+        7: "Class 3 frame from non-assoc STA",
+        8: "Leaving BSS (re-assoc)", 9: "STA not authenticated",
+        14: "MIC failure (TKIP)", 15: "4-way handshake timeout",
+        16: "Group key handshake timeout", 17: "IE mismatch",
+        23: "IEEE 802.1X auth failed",
+    }
+
+    def _mac_str(b):
+        if len(b) < 6: return "??:??:??:??:??:??"
+        return ":".join(f"{x:02x}" for x in b[:6])
+
+    def _parse_ie(payload, offset):
+        """
+        Parse 802.11 Information Elements starting at offset.
+        Returns dict: {ssid, channel, rates, enc, ht_cap, rsn, wpa}
+        """
+        result = {"ssid": "", "channel": 0, "rates": [], "enc": "Open",
+                  "rsn": False, "wpa": False, "wps": False}
+        while offset + 2 <= len(payload):
+            ie_id  = payload[offset]
+            ie_len = payload[offset + 1]
+            offset += 2
+            if offset + ie_len > len(payload):
+                break
+            ie_data = payload[offset:offset + ie_len]
+            offset += ie_len
+
+            if ie_id == 0:                  # SSID
+                try:
+                    result["ssid"] = ie_data.decode("utf-8", errors="replace")
+                except Exception:
+                    result["ssid"] = ie_data.hex()
+
+            elif ie_id == 3 and ie_len >= 1:  # DS Parameter Set (channel)
+                result["channel"] = ie_data[0]
+
+            elif ie_id == 1 or ie_id == 50:   # Supported/Extended Rates
+                rates = []
+                for b in ie_data:
+                    rate = (b & 0x7F) * 0.5
+                    rates.append(f"{rate:.0f}")
+                result["rates"].extend(rates)
+
+            elif ie_id == 48:               # RSN (WPA2/WPA3)
+                result["rsn"] = True
+                result["enc"] = "WPA2"
+                # Parse RSN to detect WPA3
+                if ie_len >= 4:
+                    ver = struct.unpack("<H", ie_data[0:2])[0]
+                    # Group cipher
+                    if ie_len >= 8:
+                        # Pairwise cipher count
+                        if ie_len >= 10:
+                            pcnt = struct.unpack("<H", ie_data[8:10])[0]
+                            # AKM suite count
+                            akm_off = 10 + pcnt * 4
+                            if ie_len >= akm_off + 2:
+                                akm_cnt = struct.unpack("<H", ie_data[akm_off:akm_off+2])[0]
+                                for i in range(akm_cnt):
+                                    off2 = akm_off + 2 + i * 4
+                                    if off2 + 4 <= ie_len:
+                                        akm_type = ie_data[off2 + 3]
+                                        if akm_type in (8, 9):   # SAE = WPA3
+                                            result["enc"] = "WPA3"
+                                        elif akm_type in (1, 2) and result["enc"] != "WPA3":
+                                            result["enc"] = "WPA2"
+                                        elif akm_type == 3:
+                                            result["enc"] += "+FT"
+
+            elif ie_id == 221 and ie_data[:4] == bytes([0x00, 0x50, 0xF2, 0x01]):
+                result["wpa"] = True  # WPA1 vendor IE
+                if result["enc"] == "Open":
+                    result["enc"] = "WPA"
+
+            elif ie_id == 221 and ie_data[:4] == bytes([0x00, 0x50, 0xF2, 0x04]):
+                result["wps"] = True   # WPS vendor IE
+
+        result["rates"] = sorted(set(result["rates"]), key=float)
+        return result
+
+    aps      = {}   # bssid → ap dict
+    clients  = {}   # mac → client dict
+    events   = []
+
+    for p in packets:
+        raw = p.get("_raw_frame", b"")
+        if not raw:
+            continue
+
+        # Handle Radiotap header (link-type 127)
+        radiotap_len = 0
+        if len(raw) >= 4 and struct.unpack("<H", raw[2:4])[0] >= 8:
+            # Radiotap: version=0, pad=0, len at offset 2
+            ver = raw[0]
+            if ver == 0:
+                try:
+                    radiotap_len = struct.unpack("<H", raw[2:4])[0]
+                except Exception:
+                    pass
+
+        dot11 = raw[radiotap_len:]
+        if len(dot11) < 10:
+            continue
+
+        fc     = struct.unpack("<H", dot11[0:2])[0]
+        ftype  = (fc >> 2) & 0x03
+        fsub   = (fc >> 4) & 0x0F
+
+        if ftype != MGMT:
+            continue   # only management frames for now
+
+        subtype_name = SUBTYPE.get(fsub, f"Mgmt-{fsub:#x}")
+
+        # Extract addresses (offsets 4, 10, 16 in 802.11 header)
+        if len(dot11) < 24:
+            continue
+        duration = struct.unpack("<H", dot11[2:4])[0]
+        addr1 = _mac_str(dot11[4:10])    # destination
+        addr2 = _mac_str(dot11[10:16])   # source / transmitter
+        addr3 = _mac_str(dot11[16:22])   # BSSID
+        seq   = struct.unpack("<H", dot11[22:24])[0]
+        body  = dot11[24:]
+
+        ts_us = p.get("ts_us", 0)
+
+        if fsub == 0x08 or fsub == 0x05:  # Beacon or Probe Response
+            if len(body) < 12:
+                continue
+            # Fixed parameters: Timestamp(8), Beacon Interval(2), Capability(2)
+            cap_info = struct.unpack("<H", body[10:12])[0]
+            ie_info  = _parse_ie(body, 12)
+            bssid    = addr2   # transmitter = AP in beacon
+            ssid     = ie_info["ssid"]
+            channel  = ie_info["channel"]
+            enc      = ie_info["enc"]
+            wps      = ie_info["wps"]
+
+            if bssid not in aps:
+                aps[bssid] = {
+                    "bssid": bssid, "ssid": ssid, "channel": channel,
+                    "enc": enc, "wps": wps,
+                    "rates": ", ".join(ie_info["rates"]) + " Mbps",
+                    "clients": set(), "probe_responses": 0, "beacons": 0,
+                }
+            ap = aps[bssid]
+            if ssid and not ap["ssid"]: ap["ssid"] = ssid
+            if channel:                 ap["channel"] = channel
+            if enc != "Open":           ap["enc"] = enc
+            if wps:                     ap["wps"] = True
+            if fsub == 0x08:            ap["beacons"] += 1
+            else:                       ap["probe_responses"] += 1
+
+            events.append(dict(
+                frame_type  = subtype_name,
+                src_mac     = bssid,
+                dst_mac     = addr1,
+                bssid       = addr3,
+                ssid        = ssid,
+                channel     = channel,
+                enc         = enc,
+                detail      = f"ch={channel} enc={enc}" + (" WPS!" if wps else ""),
+                ts_us       = ts_us,
+            ))
+
+        elif fsub == 0x04:  # Probe Request
+            ie_info = _parse_ie(body, 0)
+            ssid    = ie_info["ssid"]   # empty = wildcard
+            client_mac = addr2
+
+            if client_mac not in clients:
+                clients[client_mac] = {
+                    "mac": client_mac, "probed_ssids": set(),
+                    "associated_bssid": "", "assoc_ssid": "",
+                }
+            cl = clients[client_mac]
+            if ssid:
+                cl["probed_ssids"].add(ssid)
+
+            events.append(dict(
+                frame_type  = "Probe Request",
+                src_mac     = client_mac,
+                dst_mac     = "ff:ff:ff:ff:ff:ff",
+                bssid       = addr3,
+                ssid        = ssid or "(wildcard)",
+                channel     = 0,
+                enc         = "",
+                detail      = f"Probing: {ssid or 'any'!r}",
+                ts_us       = ts_us,
+            ))
+
+        elif fsub in (0x00, 0x02):  # Association / Reassociation Request
+            ie_info    = _parse_ie(body, 4)   # skip cap+listen interval
+            client_mac = addr2
+            bssid      = addr3
+            ssid       = ie_info["ssid"]
+
+            if client_mac not in clients:
+                clients[client_mac] = {"mac": client_mac, "probed_ssids": set(),
+                                        "associated_bssid": "", "assoc_ssid": ""}
+            clients[client_mac]["associated_bssid"] = bssid
+            clients[client_mac]["assoc_ssid"]       = ssid
+
+            if bssid in aps:
+                aps[bssid]["clients"].add(client_mac)
+
+            events.append(dict(
+                frame_type  = "Association Request",
+                src_mac     = client_mac,
+                dst_mac     = addr1,
+                bssid       = bssid,
+                ssid        = ssid,
+                channel     = 0,
+                enc         = "",
+                detail      = f"{client_mac} → {ssid!r}",
+                ts_us       = ts_us,
+            ))
+
+        elif fsub == 0x0C:  # Deauthentication
+            reason_code = struct.unpack("<H", body[0:2])[0] if len(body) >= 2 else 0
+            reason_str  = DEAUTH_REASONS.get(reason_code, f"Reason {reason_code}")
+            events.append(dict(
+                frame_type  = "Deauthentication",
+                src_mac     = addr2,
+                dst_mac     = addr1,
+                bssid       = addr3,
+                ssid        = "",
+                channel     = 0,
+                enc         = "",
+                detail      = f"Reason: {reason_str}",
+                ts_us       = ts_us,
+            ))
+
+        elif fsub == 0x0A:  # Disassociation
+            reason_code = struct.unpack("<H", body[0:2])[0] if len(body) >= 2 else 0
+            reason_str  = DEAUTH_REASONS.get(reason_code, f"Reason {reason_code}")
+            events.append(dict(
+                frame_type  = "Disassociation",
+                src_mac     = addr2,
+                dst_mac     = addr1,
+                bssid       = addr3,
+                ssid        = "",
+                channel     = 0,
+                enc         = "",
+                detail      = f"Reason: {reason_str}",
+                ts_us       = ts_us,
+            ))
+
+    # Convert client set→list for JSON-ability
+    for ap in aps.values():
+        ap["clients"] = sorted(ap["clients"])
+
+    return {
+        "aps":     sorted(aps.values(),     key=lambda x: x["ssid"]),
+        "clients": sorted(clients.values(), key=lambda x: x["mac"]),
+        "events":  events,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1421,13 +1730,90 @@ def build_graph(packets, min_packets=1, collapse_external=False, extra_hostnames
     active = {ip for pair in edges for ip in pair}
     nodes  = {k:v for k,v in nodes.items() if k in active}
 
+    # ── Infer "locally-observed" IPs from ARP / MAC presence ────────────────
+    # An IP seen in ARP sender/target or with a known MAC is definitely
+    # on a local network segment, even if it's not RFC 1918.
+    # This handles organisations using non-RFC1918 address blocks internally
+    # (e.g. 20.x.x.x, 100.64.x.x CGNAT, 172.15.x.x etc.)
+    # ── Infer locally-attached IPs from definitive L2 signals only ──────────
+    # ARP sender IPs are ALWAYS on the local segment (ARP is never routed).
+    # DHCP assigned addresses are also always local.
+    # We deliberately do NOT use "has a MAC address" for regular TCP/UDP frames:
+    # behind NAT, every packet has the gateway's MAC — using that would wrongly
+    # classify 8.8.8.8 as "local" when it's just the gateway's upstream link.
+    locally_observed_ips = set()
+    for p in packets:
+        # ARP sender/target are L2-local by definition
+        arp_s = p.get("arp_sender_ip")
+        if arp_s:
+            locally_observed_ips.add(arp_s)
+        if p.get("proto") == "ARP":
+            arp_t = p.get("dst_ip","")
+            if arp_t and arp_t not in ("0.0.0.0", "255.255.255.255"):
+                locally_observed_ips.add(arp_t)
+        # DHCP assigned IP (yiaddr) is always local
+        if p.get("proto") == "DHCP":
+            try:
+                payload = p.get("app_payload", b"")
+                if len(payload) >= 20:
+                    for off in (12, 16):   # ciaddr + yiaddr
+                        ip4 = socket.inet_ntoa(payload[off:off+4])
+                        if ip4 not in ("0.0.0.0",):
+                            locally_observed_ips.add(ip4)
+            except Exception:
+                pass
+    locally_observed_ips.discard("")
+    locally_observed_ips.discard("0.0.0.0")
+    locally_observed_ips.discard("255.255.255.255")
+
+    # ── Build the "always internal" network list ──────────────────────────────
+    # These ranges are never globally routable and must always be internal,
+    # regardless of whether we see ARP traffic for them.
+    _ALWAYS_INTERNAL_NETS = [
+        ipaddress.ip_network("10.0.0.0/8"),          # RFC 1918
+        ipaddress.ip_network("172.16.0.0/12"),        # RFC 1918
+        ipaddress.ip_network("192.168.0.0/16"),       # RFC 1918
+        ipaddress.ip_network("169.254.0.0/16"),       # Link-local (RFC 3927)
+        ipaddress.ip_network("127.0.0.0/8"),          # Loopback
+        ipaddress.ip_network("100.64.0.0/10"),        # CGNAT shared (RFC 6598)
+        ipaddress.ip_network("192.0.0.0/24"),         # IANA special (RFC 5736)
+        ipaddress.ip_network("198.18.0.0/15"),        # Benchmarking (RFC 2544)
+        ipaddress.ip_network("198.51.100.0/24"),      # Documentation (RFC 5737)
+        ipaddress.ip_network("203.0.113.0/24"),       # Documentation (RFC 5737)
+        ipaddress.ip_network("192.0.2.0/24"),         # Documentation (RFC 5737)
+        ipaddress.ip_network("240.0.0.0/4"),          # Reserved (RFC 1112)
+    ]
+    # Merge in any caller-supplied networks (--internal-networks option)
+    _extra_nets = (extra_hostnames or {}).get("__internal_networks__", [])
+    _ALL_INTERNAL_NETS = _ALWAYS_INTERNAL_NETS + list(_extra_nets)
+
+    def _is_internal_ip(ip_str):
+        """Return True if this IP belongs to a non-globally-routable / internal range."""
+        try:
+            addr2 = ipaddress.ip_address(ip_str.split("/")[0])
+            if addr2.is_private or addr2.is_link_local or addr2.is_loopback:
+                return True
+            if addr2.is_multicast:
+                return False
+            for net in _ALL_INTERNAL_NETS:
+                if addr2 in net:
+                    return True
+            if ip_str in locally_observed_ips:
+                return True
+            return False
+        except ValueError:
+            return False
+
     # ── Annotate nodes ────────────────────────────────────────────────────────
     for ip, info in nodes.items():
         try:
             addr = ipaddress.ip_address(ip.split("/")[0])
-            info["is_private"] = addr.is_private
-            info["subnet"] = (str(ipaddress.ip_network(ip+"/24", strict=False))
-                              if addr.is_private else "external")
+            is_priv = _is_internal_ip(ip)
+            if ip == "255.255.255.255" or addr.is_multicast:
+                is_priv = False
+            info["is_private"] = is_priv
+            info["subnet"] = (str(ipaddress.ip_network(ip + "/24", strict=False))
+                              if is_priv else "external")
         except ValueError:
             info["is_private"] = False; info["subnet"] = "external"
 
@@ -1672,7 +2058,12 @@ def resolve_hostnames_from_packets(packets):
 
 
 def _parse_dns(data, setter):
-    """Parse DNS wire format; extract A/AAAA answer records -> ip -> name."""
+    """
+    Parse DNS / mDNS wire format.
+    Extracts hostname→IP mappings (A, AAAA), PTR records, SRV, TXT.
+    Calls setter(ip, name, priority) for every resolved mapping.
+    Also handles mDNS reverse PTR (x.x.x.x.in-addr.arpa → hostname).
+    """
     try:
         if len(data) < 12:
             return
@@ -1680,26 +2071,293 @@ def _parse_dns(data, setter):
         is_resp  = (flags >> 15) & 1
         qd_count = struct.unpack(">H", data[4:6])[0]
         an_count = struct.unpack(">H", data[6:8])[0]
-        if not is_resp or an_count == 0:
-            return
+        ar_count = struct.unpack(">H", data[10:12])[0]   # additional records
+
+        # Process ALL record sections: answers + additional records
+        # (mDNS puts A records in the Additional section after PTR answers)
+        total_answers = an_count + ar_count
+
+        if not is_resp and an_count == 0 and ar_count == 0:
+            return   # pure query with no piggybacked answers — skip for hostname resolution
+
         offset = 12
-        for _ in range(qd_count):        # skip questions
+        # Skip questions
+        for _ in range(qd_count):
             offset = _dns_skip_name(data, offset)
-            offset += 4
-        for _ in range(an_count):        # parse answers
-            name, offset = _dns_read_name(data, offset)
-            if offset + 10 > len(data):
-                break
-            rtype, _, _, rdlen = struct.unpack(">HHIH", data[offset:offset+10])
-            offset += 10
-            rdata = data[offset:offset+rdlen]
-            offset += rdlen
-            if rtype == 1 and rdlen == 4:       # A
-                setter(socket.inet_ntoa(rdata), name, 1)
-            elif rtype == 28 and rdlen == 16:    # AAAA
-                setter(socket.inet_ntop(socket.AF_INET6, rdata), name, 1)
+            if offset + 4 > len(data): return
+            offset += 4   # QTYPE + QCLASS
+
+        def _process_section(count):
+            nonlocal offset
+            for _ in range(count):
+                if offset + 2 > len(data): break
+                name, offset = _dns_read_name(data, offset)
+                if offset + 10 > len(data): break
+                rtype = struct.unpack(">H", data[offset:offset+2])[0]
+                # Skip class (2), TTL (4)
+                rdlen = struct.unpack(">H", data[offset+8:offset+10])[0]
+                offset += 10
+                if offset + rdlen > len(data): break
+                rdata = data[offset:offset+rdlen]
+                offset += rdlen
+
+                if rtype == 1 and rdlen == 4:       # A record
+                    try:
+                        ip = socket.inet_ntoa(rdata)
+                        setter(ip, name.rstrip("."), 1)
+                    except Exception: pass
+
+                elif rtype == 28 and rdlen == 16:   # AAAA record
+                    try:
+                        ip = socket.inet_ntop(socket.AF_INET6, rdata)
+                        setter(ip, name.rstrip("."), 1)
+                    except Exception: pass
+
+                elif rtype == 12:                   # PTR record
+                    try:
+                        ptr_name, _ = _dns_read_name(data, offset - rdlen)
+                        # Reverse PTR: x.x.x.x.in-addr.arpa → hostname
+                        if ".in-addr.arpa" in name.lower():
+                            # Decode reversed IP: 4.3.2.1.in-addr.arpa → 1.2.3.4
+                            parts = name.lower().replace(".in-addr.arpa","").split(".")
+                            if len(parts) == 4:
+                                fwd_ip = ".".join(reversed(parts))
+                                setter(fwd_ip, ptr_name.rstrip("."), 2)
+                        elif ".ip6.arpa" not in name.lower():
+                            # mDNS service PTR: _http._tcp.local → service name
+                            # The PTR target is the device hostname
+                            pass   # handled by SRV below
+                    except Exception: pass
+
+                elif rtype == 33:                   # SRV record
+                    try:
+                        if rdlen >= 6:
+                            srv_target, _ = _dns_read_name(data, offset - rdlen + 6)
+                            # SRV target is the canonical hostname — no IP yet
+                            pass
+                    except Exception: pass
+
+        _process_section(an_count)
+        _process_section(ar_count)
+
     except Exception:
         pass
+
+
+def _extract_dns_events(packets):
+    """
+    Extract every DNS and mDNS query/response event from a packet list.
+    Returns list of dicts:
+      { client_ip, server_ip, direction, proto, query_name, qtype,
+        answer_ip, answer_name, ttl, is_response, flags_desc, ts_us }
+
+    Record types decoded: A(1), AAAA(28), CNAME(5), PTR(12), MX(15), NS(2),
+                          SRV(33), TXT(16), SOA(6), ANY(255)
+    """
+    RTYPES = {
+        1:"A", 2:"NS", 5:"CNAME", 6:"SOA", 12:"PTR", 15:"MX",
+        16:"TXT", 28:"AAAA", 33:"SRV", 41:"OPT", 255:"ANY",
+        65:"HTTPS", 64:"SVCB",
+    }
+
+    events = []
+
+    for p in packets:
+        proto   = p.get("proto","")
+        payload = p.get("app_payload", b"")
+        if proto not in ("DNS","mDNS") or not payload or len(payload) < 12:
+            continue
+
+        src_ip = p.get("src_ip","")
+        dst_ip = p.get("dst_ip","")
+        sp     = p.get("src_port",0)
+        dp     = p.get("dst_port",0)
+        ts_us  = p.get("ts_us",0)
+
+        # mDNS: src=client, dst=224.0.0.251. For regular DNS:
+        # query: client→53, response: 53→client
+        is_mdns = (proto == "mDNS")
+
+        try:
+            txid     = struct.unpack(">H", payload[0:2])[0]
+            flags    = struct.unpack(">H", payload[2:4])[0]
+            is_resp  = (flags >> 15) & 1
+            qd_count = struct.unpack(">H", payload[4:6])[0]
+            an_count = struct.unpack(">H", payload[6:8])[0]
+            ns_count = struct.unpack(">H", payload[8:10])[0]
+            ar_count = struct.unpack(">H", payload[10:12])[0]
+
+            # Decode flags
+            rcode    = flags & 0x000F
+            opcode   = (flags >> 11) & 0x000F
+            aa       = (flags >> 10) & 1
+            tc       = (flags >> 9) & 1
+            rd       = (flags >> 8) & 1
+            ra       = (flags >> 7) & 1
+
+            flags_parts = []
+            if is_resp:   flags_parts.append("Response")
+            else:         flags_parts.append("Query")
+            if aa:        flags_parts.append("AA")
+            if rd:        flags_parts.append("RD")
+            if ra:        flags_parts.append("RA")
+            if tc:        flags_parts.append("TC")
+            rcodes = {0:"NOERROR",1:"FORMERR",2:"SERVFAIL",3:"NXDOMAIN",
+                      4:"NOTIMP",5:"REFUSED"}
+            rcode_str = rcodes.get(rcode, f"RCODE{rcode}")
+            if rcode: flags_parts.append(rcode_str)
+            flags_desc = " | ".join(flags_parts)
+
+            client_ip = src_ip if not is_resp else dst_ip
+            server_ip = dst_ip if not is_resp else src_ip
+            if is_mdns:
+                client_ip = src_ip
+                server_ip = "224.0.0.251 (mDNS)"
+
+            offset = 12
+
+            # ── Parse questions ────────────────────────────────────────────
+            questions = []
+            for _ in range(qd_count):
+                if offset >= len(payload): break
+                qname, offset = _dns_read_name(payload, offset)
+                if offset + 4 > len(payload): break
+                qt  = struct.unpack(">H", payload[offset:offset+2])[0]
+                qc  = struct.unpack(">H", payload[offset+2:offset+4])[0]
+                offset += 4
+                qt_str = RTYPES.get(qt, str(qt))
+                questions.append((qname.rstrip("."), qt_str))
+
+            # ── Parse answer records ───────────────────────────────────────
+            def parse_rrs(count):
+                nonlocal offset
+                records = []
+                for _ in range(count):
+                    if offset + 2 > len(payload): break
+                    rname, offset = _dns_read_name(payload, offset)
+                    if offset + 10 > len(payload): break
+                    rtype  = struct.unpack(">H", payload[offset:offset+2])[0]
+                    rclass = struct.unpack(">H", payload[offset+2:offset+4])[0]
+                    rttl   = struct.unpack(">I", payload[offset+4:offset+8])[0]
+                    rdlen  = struct.unpack(">H", payload[offset+8:offset+10])[0]
+                    offset += 10
+                    if offset + rdlen > len(payload): break
+                    rdata  = payload[offset:offset+rdlen]
+                    offset += rdlen
+
+                    rtype_str = RTYPES.get(rtype, str(rtype))
+                    answer_ip   = ""
+                    answer_name = ""
+                    answer_val  = ""
+
+                    if rtype == 1 and rdlen == 4:    # A
+                        try: answer_ip = socket.inet_ntoa(rdata)
+                        except: pass
+                        answer_val = answer_ip
+
+                    elif rtype == 28 and rdlen == 16: # AAAA
+                        try: answer_ip = socket.inet_ntop(socket.AF_INET6, rdata)
+                        except: pass
+                        answer_val = answer_ip
+
+                    elif rtype in (5, 12, 2):         # CNAME, PTR, NS
+                        try:
+                            n, _ = _dns_read_name(payload, offset - rdlen)
+                            answer_name = n.rstrip(".")
+                            answer_val  = answer_name
+                        except: pass
+
+                    elif rtype == 15 and rdlen >= 3:  # MX
+                        pref = struct.unpack(">H", rdata[:2])[0]
+                        try:
+                            exch, _ = _dns_read_name(payload, offset - rdlen + 2)
+                            answer_val = f"[pref={pref}] {exch.rstrip('.')}"
+                            answer_name = exch.rstrip(".")
+                        except: pass
+
+                    elif rtype == 16:                 # TXT
+                        parts = []
+                        pos2 = 0
+                        while pos2 < len(rdata):
+                            slen = rdata[pos2]; pos2 += 1
+                            parts.append(rdata[pos2:pos2+slen].decode("utf-8","replace"))
+                            pos2 += slen
+                        answer_val = "; ".join(parts)[:200]
+
+                    elif rtype == 33 and rdlen >= 6:  # SRV
+                        pri = struct.unpack(">H", rdata[0:2])[0]
+                        wt  = struct.unpack(">H", rdata[2:4])[0]
+                        pt  = struct.unpack(">H", rdata[4:6])[0]
+                        try:
+                            tgt, _ = _dns_read_name(payload, offset - rdlen + 6)
+                            answer_val = f"{tgt.rstrip('.')}:{pt} (pri={pri})"
+                        except: pass
+
+                    elif rtype == 41:                 # OPT (EDNS0) — skip silently
+                        continue
+
+                    records.append({
+                        "rname": rname.rstrip("."),
+                        "rtype": rtype_str,
+                        "ttl":   rttl,
+                        "answer_ip":   answer_ip,
+                        "answer_name": answer_name,
+                        "answer_val":  answer_val,
+                    })
+                return records
+
+            answers    = parse_rrs(an_count)
+            auth_rrs   = parse_rrs(ns_count)
+            addl_rrs   = parse_rrs(ar_count)
+
+            # ── Emit one event row per question×answer pair ───────────────
+            if not questions:
+                # Unsolicited announcement (mDNS) — no question, just answers
+                for ans in answers + addl_rrs:
+                    if ans["rtype"] in ("A","AAAA","PTR","CNAME"):
+                        events.append(dict(
+                            client_ip   = client_ip,
+                            server_ip   = server_ip,
+                            proto       = proto,
+                            query_name  = ans["rname"],
+                            qtype       = ans["rtype"],
+                            answer_ip   = ans["answer_ip"],
+                            answer_name = ans["answer_name"],
+                            answer_val  = ans["answer_val"],
+                            ttl         = ans["ttl"],
+                            rcode       = rcode_str,
+                            is_response = bool(is_resp),
+                            flags_desc  = flags_desc,
+                            ts_us       = ts_us,
+                        ))
+            else:
+                for qname, qt_str in questions:
+                    # Find matching answers (same name or any answer if no match)
+                    matching = [a for a in answers if a["rname"].lower() == qname.lower()
+                                or a["rname"].lower().endswith("." + qname.lower())]
+                    if not matching:
+                        matching = answers or [None]
+                    for ans in matching:
+                        events.append(dict(
+                            client_ip   = client_ip,
+                            server_ip   = server_ip,
+                            proto       = proto,
+                            query_name  = qname,
+                            qtype       = qt_str,
+                            answer_ip   = ans["answer_ip"]   if ans else "",
+                            answer_name = ans["answer_name"] if ans else "",
+                            answer_val  = ans["answer_val"]  if ans else "",
+                            ttl         = ans["ttl"]         if ans else 0,
+                            rcode       = rcode_str,
+                            is_response = bool(is_resp),
+                            flags_desc  = flags_desc,
+                            ts_us       = ts_us,
+                        ))
+
+        except Exception:
+            continue
+
+    return events
 
 
 def _dns_read_name(data, offset):
@@ -1764,34 +2422,116 @@ def _parse_dhcp(data, setter):
 
 
 def _parse_nbns(data, src_ip, setter):
-    """Extract NetBIOS name from NBNS registration/response packets."""
+    """
+    Extract NetBIOS name from NBNS packets (both registrations and responses).
+
+    NBNS wire format (RFC 1002 Section 4.2):
+      Header:  12 bytes (TXID, FLAGS, QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT)
+      Questions: QDCOUNT × (QNAME + QTYPE[2] + QCLASS[2])
+      Answers:   ANCOUNT × (NAME + TYPE[2] + CLASS[2] + TTL[4] + RDLEN[2] + RDATA)
+
+    QNAME/NAME encoding: a single label of length 0x20 (32 bytes) containing
+    the Level-2 half-ASCII encoded 16-character NetBIOS name, followed by
+    a null terminator byte (0x00).
+
+    For registrations (QD=1, AN=0): name is in the question QNAME.
+    For responses    (QD=0, AN=1): name is in the answer NAME.
+    """
     try:
-        if len(data) < 12: return
-        an_count = struct.unpack(">H", data[6:8])[0]
+        if len(data) < 12:
+            return
         qd_count = struct.unpack(">H", data[4:6])[0]
-        offset = 12
+        an_count = struct.unpack(">H", data[6:8])[0]
+        offset   = 12
+
+        def _read_nbns_name(buf, off):
+            """
+            Read a NetBIOS encoded name at buf[off].
+            Returns (decoded_name_str, new_offset) or ("", new_offset_past_name).
+            """
+            if off >= len(buf):
+                return "", off
+            ln = buf[off]; off += 1
+            if ln == 0x20:                  # standard 32-byte NBNS label
+                if off + 32 > len(buf):
+                    return "", off + 32
+                raw  = buf[off:off+32]
+                name = _decode_nbns_name(raw).strip()
+                off += 32
+                # null terminator
+                if off < len(buf) and buf[off] == 0:
+                    off += 1
+                return name, off
+            elif ln == 0:                   # already at null terminator
+                return "", off
+            else:
+                # skip non-standard label length gracefully
+                off += min(ln, len(buf) - off)
+                if off < len(buf) and buf[off] == 0:
+                    off += 1
+                return "", off
+
+        # ── Questions ────────────────────────────────────────────────────────
         for _ in range(qd_count):
-            if offset + 35 < len(data): offset += 35
-            else: return
-        for _ in range(an_count):
-            if offset + 33 >= len(data): break
-            raw = data[offset+1:offset+33]
-            name = _decode_nbns_name(raw).strip()
+            if offset >= len(data):
+                break
+            name, offset = _read_nbns_name(data, offset)
+            offset += 4   # QTYPE + QCLASS
             if name and name not in ("*", "__MSBROWSE__", ""):
                 setter(src_ip, name, 3)
-            offset += 46
+
+        # ── Answers ──────────────────────────────────────────────────────────
+        for _ in range(an_count):
+            if offset >= len(data):
+                break
+            name, offset = _read_nbns_name(data, offset)
+            if offset + 10 > len(data):
+                break
+            rtype  = struct.unpack(">H", data[offset:offset+2])[0]
+            offset += 8   # TYPE + CLASS + TTL
+            rdlen  = struct.unpack(">H", data[offset:offset+2])[0]
+            offset += 2
+            rdata  = data[offset:offset+rdlen]
+            offset += rdlen
+            # Extract owner IP from NB record RDATA (2-byte flags + 4-byte IP)
+            if name and rtype == 0x0020 and rdlen >= 6:
+                try:
+                    owner_ip = socket.inet_ntoa(rdata[2:6])
+                    if owner_ip and owner_ip not in ("0.0.0.0",):
+                        setter(owner_ip, name, 3)
+                    else:
+                        setter(src_ip, name, 3)
+                except Exception:
+                    setter(src_ip, name, 3)
+            elif name and name not in ("*", "__MSBROWSE__", ""):
+                setter(src_ip, name, 3)
+
     except Exception:
         pass
 
 
 def _decode_nbns_name(raw):
+    """
+    Decode a Level-2 half-ASCII encoded NetBIOS name.
+    Each original byte is split into two nibbles, each stored as (nibble + 0x41).
+    So to decode: take pairs of bytes (A, B) → char = ((A-0x41)<<4) | (B-0x41)
+    The name is padded to 16 chars (15 + suffix byte); strip trailing spaces.
+    """
     try:
         chars = []
-        for i in range(0, min(len(raw), 30), 2):
-            c = ((raw[i] - 0x41) << 4) | (raw[i+1] - 0x41)
-            if 0x20 < c < 0x7f:
+        for i in range(0, min(len(raw), 32), 2):
+            a, b = raw[i], raw[i+1]
+            # Validate: both bytes must be in range 0x41–0x50 (A–P)
+            if not (0x41 <= a <= 0x50 and 0x41 <= b <= 0x50):
+                break
+            c = ((a - 0x41) << 4) | (b - 0x41)
+            # Include all printable ASCII including space (0x20)
+            if 0x20 <= c < 0x7f:
                 chars.append(chr(c))
-        return "".join(chars)
+            else:
+                break   # non-printable → stop (suffix byte or corruption)
+        # Strip trailing spaces (padding) but keep internal spaces
+        return "".join(chars).rstrip()
     except Exception:
         return ""
 
@@ -2421,7 +3161,7 @@ def _add_legend(g, findings):
 # Excel export
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls_sessions, output_path):
+def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls_sessions, dns_events, wifi_data, output_path):
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -2984,6 +3724,254 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls
     ws8.merge_cells(start_row=1, start_column=1, end_row=1, end_column=18)
 
 
+
+    # ── Sheet 9: DNS / mDNS Events ────────────────────────────────────────────
+    ws9 = wb.create_sheet("DNS Events")
+
+    HDR9 = ["Direction","Protocol","Client IP","Server/Resolver IP",
+            "Query Name","Type","Answer IP / Value","Answer Name",
+            "TTL (s)","Response Code","Flags"]
+    apply_hdr(ws9, HDR9, "1A4A1A")
+    ws9.freeze_panes = "A2"
+
+    RTYPE_CLR = {"A":"D9F0D3","AAAA":"C6E2FF","CNAME":"FFF2CC",
+                 "PTR":"FFE0CC","MX":"F0D9F0","TXT":"F0F0F0",
+                 "SRV":"E8D5FF","NS":"D0D0D0","HTTPS":"C6F0FF"}
+    RCODE_CLR = {"NXDOMAIN":"FFC0C0","SERVFAIL":"FFB366","REFUSED":"FFD0D0"}
+
+    if not dns_events:
+        ws9.cell(row=2, column=1, value="No DNS/mDNS events captured in this PCAP.")
+    else:
+        # Sort: queries first, then responses; within each by client IP
+        def _dns_sort(e):
+            return (0 if not e["is_response"] else 1,
+                    e.get("client_ip",""),
+                    e.get("query_name",""))
+        sorted_events = sorted(dns_events, key=_dns_sort)
+
+        for ri, ev in enumerate(sorted_events, 2):
+            ws9.row_dimensions[ri].height = 20
+            alt = (ri % 2 == 0)
+            direction = "← Response" if ev["is_response"] else "→ Query"
+            rcode = ev.get("rcode","")
+
+            vals = [
+                direction,
+                ev.get("proto","DNS"),
+                ev.get("client_ip",""),
+                ev.get("server_ip",""),
+                ev.get("query_name",""),
+                ev.get("qtype",""),
+                ev.get("answer_val",""),
+                ev.get("answer_name",""),
+                ev.get("ttl","") or "",
+                rcode,
+                ev.get("flags_desc",""),
+            ]
+            for ci, v in enumerate(vals, 1):
+                c = body_cell(ws9, ri, ci, v, alt, centre=(ci in {1,2,6,9,10}))
+                c.alignment = Alignment(
+                    horizontal="center" if ci in {1,2,6,9,10} else "left",
+                    vertical="center",
+                    wrap_text=(ci in {5,7,8,11}))
+
+                # Colour direction column
+                if ci == 1:
+                    clr = "1A4A1A" if "Response" in str(v) else "4A1A1A"
+                    c.font = Font(name="Arial", size=9, bold=True, color="FFFFFF")
+                    c.fill = PatternFill("solid", fgColor=clr)
+
+                # Colour record type
+                elif ci == 6:
+                    qtype_bg = RTYPE_CLR.get(str(v),"FFFFFF")
+                    c.fill   = PatternFill("solid", fgColor=qtype_bg)
+                    c.font   = Font(name="Arial", size=9, bold=True)
+
+                # Red for NXDOMAIN etc
+                elif ci == 10 and rcode in RCODE_CLR:
+                    c.fill = PatternFill("solid", fgColor=RCODE_CLR[rcode])
+                    c.font = Font(name="Arial", size=9, bold=True, color="8B0000")
+
+    col_w(ws9, [12, 8, 16, 18, 38, 8, 32, 28, 7, 10, 30])
+
+    # Summary banner
+    ws9.insert_rows(1)
+    ws9.row_dimensions[1].height = 32
+    n_queries   = sum(1 for e in dns_events if not e["is_response"])
+    n_responses = sum(1 for e in dns_events if e["is_response"])
+    n_nxdomain  = sum(1 for e in dns_events if e.get("rcode")=="NXDOMAIN")
+    n_mdns      = sum(1 for e in dns_events if e.get("proto")=="mDNS")
+    unique_names = len({e["query_name"] for e in dns_events if e.get("query_name")})
+    dns_summ = ws9.cell(row=1, column=1,
+        value=(f"DNS & mDNS EVENT LOG  |  "
+               f"Total: {len(dns_events)}   "
+               f"Queries: {n_queries}   Responses: {n_responses}   "
+               f"mDNS: {n_mdns}   NXDOMAIN: {n_nxdomain}   "
+               f"Unique names queried: {unique_names}"))
+    dns_summ.font  = Font(name="Arial", bold=True, size=11, color="FFFFFF")
+    dns_summ.fill  = PatternFill("solid", fgColor="1A4A1A")
+    dns_summ.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws9.merge_cells(start_row=1, start_column=1, end_row=1, end_column=11)
+
+
+    # ── Sheet 10: Wi-Fi Networks & Clients ────────────────────────────────────
+    ws10 = wb.create_sheet("Wi-Fi Networks")
+    aps_list     = wifi_data.get("aps", [])
+    clients_list = wifi_data.get("clients", [])
+    wifi_events  = wifi_data.get("events", [])
+
+    if not aps_list and not clients_list:
+        ws10.cell(row=1, column=1,
+                  value=("No 802.11 management frames found. "
+                         "To capture Wi-Fi data, use monitor mode: "
+                         "airmon-ng start wlan0 && tcpdump -i wlan0mon -w wifi.pcap"))
+        col_w(ws10, [80])
+    else:
+        # ── AP table ──────────────────────────────────────────────────────
+        HDR_AP = ["BSSID (AP MAC)","SSID","Channel","Encryption",
+                  "WPS","Beacons","Probe Resp","Associated Clients","Notes"]
+        apply_hdr(ws10, HDR_AP, "1B2A5C")
+        ws10.freeze_panes = "A2"
+
+        ENC_CLR = {"Open":"C00000","WPA":"C55A11","WPA2":"375623",
+                   "WPA3":"1F7A1F","WPA2+FT":"375623"}
+
+        for ri, ap in enumerate(aps_list, 2):
+            ws10.row_dimensions[ri].height = 22
+            alt = (ri % 2 == 0)
+            enc = ap.get("enc","Open")
+            ssid = ap.get("ssid","<Hidden>") or "<Hidden>"
+            notes = []
+            if enc == "Open":     notes.append("⚠ Open network — no encryption")
+            if ap.get("wps"):     notes.append("⚠ WPS enabled — KRACK/Pixie-Dust risk")
+            if not ap.get("ssid"): notes.append("Hidden SSID")
+
+            vals = [
+                ap["bssid"],
+                ssid,
+                ap.get("channel","") or "",
+                enc,
+                "Yes" if ap.get("wps") else "No",
+                ap.get("beacons",0),
+                ap.get("probe_responses",0),
+                ", ".join(ap.get("clients",[])) or "None seen",
+                "; ".join(notes),
+            ]
+            for ci, v in enumerate(vals, 1):
+                c = body_cell(ws10, ri, ci, v, alt, centre=(ci in {3,5,6,7}))
+                c.alignment = Alignment(
+                    horizontal="center" if ci in {3,5,6,7} else "left",
+                    vertical="center", wrap_text=(ci in {8,9}))
+                # Colour encryption column
+                if ci == 4:
+                    enc_bg = ENC_CLR.get(enc.split("+")[0], "595959")
+                    c.font = Font(name="Arial", size=9, bold=True, color="FFFFFF")
+                    c.fill = PatternFill("solid", fgColor=enc_bg)
+                # Red for open / WPS
+                elif ci == 9 and notes:
+                    c.font = Font(name="Arial", size=9, bold=True, color="8B0000")
+
+        col_w(ws10, [20, 28, 8, 10, 6, 9, 10, 45, 45])
+
+        # ── Clients section ───────────────────────────────────────────────
+        client_start = len(aps_list) + 4
+        ws10.cell(row=client_start-1, column=1, value="Wi-Fi Clients / Stations")
+        hdr_row = ws10.row_dimensions[client_start-1]
+        hdr_row.height = 24
+        c_hdr = ws10.cell(row=client_start-1, column=1)
+        c_hdr.font = Font(name="Arial", bold=True, size=11, color="FFFFFF")
+        c_hdr.fill = PatternFill("solid", fgColor="3A1A5C")
+        ws10.merge_cells(start_row=client_start-1, start_column=1,
+                         end_row=client_start-1, end_column=4)
+
+        HDR_CL = ["Client MAC","Associated BSSID","Associated SSID","Probed SSIDs"]
+        for ci, h in enumerate(HDR_CL, 1):
+            c = ws10.cell(row=client_start, column=ci, value=h)
+            c.font  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+            c.fill  = PatternFill("solid", fgColor="3A1A5C")
+            c.alignment = Alignment(horizontal="left", vertical="center")
+            c.border = bdr
+
+        for ri, cl in enumerate(clients_list, client_start+1):
+            ws10.row_dimensions[ri].height = 20
+            alt = (ri % 2 == 0)
+            vals = [
+                cl["mac"],
+                cl.get("associated_bssid",""),
+                cl.get("assoc_ssid",""),
+                ", ".join(sorted(cl.get("probed_ssids", set()))) or "(wildcard only)",
+            ]
+            for ci, v in enumerate(vals, 1):
+                body_cell(ws10, ri, ci, v, alt)
+
+        # ── Events section ────────────────────────────────────────────────
+        if wifi_events:
+            evt_start = client_start + len(clients_list) + 4
+            ws10.cell(row=evt_start-1, column=1, value="802.11 Management Frame Events")
+            c_hdr2 = ws10.cell(row=evt_start-1, column=1)
+            c_hdr2.font = Font(name="Arial", bold=True, size=11, color="FFFFFF")
+            c_hdr2.fill = PatternFill("solid", fgColor="1A3A5C")
+            ws10.merge_cells(start_row=evt_start-1, start_column=1,
+                             end_row=evt_start-1, end_column=6)
+
+            HDR_EV = ["Frame Type","Source MAC","Destination MAC","BSSID","SSID","Detail"]
+            for ci, h in enumerate(HDR_EV, 1):
+                c = ws10.cell(row=evt_start, column=ci, value=h)
+                c.font  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+                c.fill  = PatternFill("solid", fgColor="1A3A5C")
+                c.alignment = Alignment(horizontal="left", vertical="center")
+                c.border = bdr
+
+            EVT_CLR = {
+                "Beacon":             "EBF3FB",
+                "Probe Request":      "FFF2CC",
+                "Probe Response":     "E2EFDA",
+                "Association Request":"D9D9FF",
+                "Deauthentication":   "FFD0D0",
+                "Disassociation":     "FFDCC0",
+            }
+            # Limit to 500 events in sheet (can be huge)
+            shown_events = wifi_events[:500]
+            for ri, ev in enumerate(shown_events, evt_start+1):
+                ws10.row_dimensions[ri].height = 18
+                alt = (ri % 2 == 0)
+                ft = ev.get("frame_type","")
+                vals = [
+                    ft,
+                    ev.get("src_mac",""),
+                    ev.get("dst_mac",""),
+                    ev.get("bssid",""),
+                    ev.get("ssid",""),
+                    ev.get("detail",""),
+                ]
+                row_fill = EVT_CLR.get(ft, "FFFFFF")
+                for ci, v in enumerate(vals, 1):
+                    c = body_cell(ws10, ri, ci, v, False)
+                    c.fill = PatternFill("solid", fgColor=row_fill)
+                    c.alignment = Alignment(horizontal="left", vertical="center")
+                    if ft in ("Deauthentication","Disassociation") and ci == 1:
+                        c.font = Font(name="Arial", size=9, bold=True, color="C00000")
+
+        # Summary banner (insert at top)
+        ws10.insert_rows(1)
+        ws10.row_dimensions[1].height = 32
+        n_open = sum(1 for a in aps_list if a.get("enc","Open") == "Open")
+        n_wps  = sum(1 for a in aps_list if a.get("wps"))
+        n_deauth = sum(1 for e in wifi_events if e.get("frame_type") == "Deauthentication")
+        wifi_summ = ws10.cell(row=1, column=1,
+            value=(f"Wi-Fi NETWORK SURVEY  |  "
+                   f"APs: {len(aps_list)}   "
+                   f"Clients: {len(clients_list)}   "
+                   f"Open networks: {n_open}   "
+                   f"WPS enabled: {n_wps}   "
+                   f"Deauth frames: {n_deauth}   "
+                   f"Total mgmt events: {len(wifi_events)}"))
+        wifi_summ.font  = Font(name="Arial", bold=True, size=11, color="FFFFFF")
+        wifi_summ.fill  = PatternFill("solid", fgColor="1B2A5C")
+        wifi_summ.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        ws10.merge_cells(start_row=1, start_column=1, end_row=1, end_column=9)
+
+
     wb.save(output_path)
     return True
 
@@ -3066,16 +4054,34 @@ def main():
     print(f"[*] {len(tls_sessions)} TLS session(s) reconstructed  "
           f"({n_tls_issues} with issues)")
 
+    # DNS / mDNS event log
+    dns_events = _extract_dns_events(packets)
+    n_mdns     = sum(1 for e in dns_events if e.get("proto") == "mDNS")
+    n_nxdomain = sum(1 for e in dns_events if e.get("rcode") == "NXDOMAIN")
+    print(f"[*] {len(dns_events)} DNS events extracted  "
+          f"({n_mdns} mDNS · {n_nxdomain} NXDOMAIN)")
+
+    # Wi-Fi 802.11 network survey
+    wifi_data   = extract_wifi_events(packets)
+    n_aps       = len(wifi_data["aps"])
+    n_clients   = len(wifi_data["clients"])
+    n_deauths   = sum(1 for e in wifi_data["events"] if e.get("frame_type") == "Deauthentication")
+    if n_aps or n_clients:
+        print(f"[*] Wi-Fi survey: {n_aps} AP(s) · {n_clients} client(s) · {n_deauths} deauth frame(s)")
+    else:
+        print(f"[*] No 802.11 frames detected (not a Wi-Fi capture)")
+
     xml = generate_drawio(nodes, findings, gateways, traceroutes, title=args.title)
     with open(out_dio,"w",encoding="utf-8") as f:
         f.write(xml)
     print(f"[+] Diagram  → {out_dio}")
 
-    ok = generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls_sessions, out_xl)
+    ok = generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls_sessions, dns_events, wifi_data, out_xl)
     if ok:
-        print(f"[+] Workbook → {out_xl}  (8 sheets: Connections, Node Summary, "
+        print(f"[+] Workbook → {out_xl}  (10 sheets: Connections, Node Summary, "
               f"Pentest Findings, Protocol Summary, Port Inventory, "
-              f"Cleartext Intercepts, Banner Intel, TLS Sessions)")
+              f"Cleartext Intercepts, Banner Intel, TLS Sessions, "
+              f"DNS Events, Wi-Fi Networks)")
 
     print()
     print("  draw.io: File → Import From → Device → .drawio file")
