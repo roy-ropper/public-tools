@@ -116,14 +116,21 @@ def parse_pcap(path):
             return
         else:
             raise ValueError(f"Unrecognised magic: {magic:#010x}")
-        f.read(20)
+        rest = f.read(20)
+        # Link type is at bytes 20-23 of global header (index 16-19 of this 20-byte chunk)
+        ltype = 1   # default: Ethernet
+        if len(rest) >= 20:
+            try:
+                ltype = struct.unpack(endian + "I", rest[16:20])[0]
+            except Exception:
+                pass
         while True:
             rec = f.read(16)
             if len(rec) < 16:
                 break
             _, ts_us, incl_len, _ = struct.unpack(endian + "IIII", rec)
             raw = f.read(incl_len)
-            r = _dissect(raw, 1, ts_us)
+            r = _dissect(raw, ltype, ts_us)
             if r:
                 yield r
 
@@ -1413,30 +1420,31 @@ def extract_wifi_events(packets):
                 result["rates"].extend(rates)
 
             elif ie_id == 48:               # RSN (WPA2/WPA3)
+                # RSN IE layout (IEEE 802.11-2020):
+                #   [0:2]  Version (2)
+                #   [2:6]  Group Cipher Suite (4)
+                #   [6:8]  Pairwise Cipher Count (2)
+                #   [8:8+cnt*4]  Pairwise Cipher Suite List
+                #   [8+cnt*4:8+cnt*4+2]  AKM Suite Count (2)
+                #   then AKM Suite List
                 result["rsn"] = True
                 result["enc"] = "WPA2"
-                # Parse RSN to detect WPA3
-                if ie_len >= 4:
-                    ver = struct.unpack("<H", ie_data[0:2])[0]
-                    # Group cipher
-                    if ie_len >= 8:
-                        # Pairwise cipher count
-                        if ie_len >= 10:
-                            pcnt = struct.unpack("<H", ie_data[8:10])[0]
-                            # AKM suite count
-                            akm_off = 10 + pcnt * 4
-                            if ie_len >= akm_off + 2:
-                                akm_cnt = struct.unpack("<H", ie_data[akm_off:akm_off+2])[0]
-                                for i in range(akm_cnt):
-                                    off2 = akm_off + 2 + i * 4
-                                    if off2 + 4 <= ie_len:
-                                        akm_type = ie_data[off2 + 3]
-                                        if akm_type in (8, 9):   # SAE = WPA3
-                                            result["enc"] = "WPA3"
-                                        elif akm_type in (1, 2) and result["enc"] != "WPA3":
-                                            result["enc"] = "WPA2"
-                                        elif akm_type == 3:
-                                            result["enc"] += "+FT"
+                if ie_len >= 8:
+                    pcnt = struct.unpack("<H", ie_data[6:8])[0]
+                    akm_off = 8 + pcnt * 4          # start of AKM count field
+                    if akm_off + 2 <= ie_len:
+                        akm_cnt = struct.unpack("<H", ie_data[akm_off:akm_off+2])[0]
+                        for i in range(min(akm_cnt, 8)):  # cap to avoid runaway
+                            off2 = akm_off + 2 + i * 4
+                            if off2 + 4 <= ie_len:
+                                akm_type = ie_data[off2 + 3]
+                                if akm_type in (8, 9, 18):   # SAE / OWE = WPA3
+                                    result["enc"] = "WPA3"
+                                elif akm_type in (1, 2) and result["enc"] != "WPA3":
+                                    result["enc"] = "WPA2"
+                                elif akm_type in (3, 4):     # FT variants
+                                    if result["enc"] != "WPA3":
+                                        result["enc"] += "+FT"
 
             elif ie_id == 221 and ie_data[:4] == bytes([0x00, 0x50, 0xF2, 0x01]):
                 result["wpa"] = True  # WPA1 vendor IE
@@ -3196,8 +3204,16 @@ def generate_xlsx(rows, nodes, edges, findings, cleartext_hits, banner_hits, tls
             c.font = hs["font"]; c.fill = hs["fill"]
             c.alignment = hs["align"]; c.border = bdr
 
+    def _sanitise(v):
+        """Strip illegal XML/openpyxl characters (control chars, null bytes)."""
+        if not isinstance(v, str):
+            return v
+        # Remove null bytes and other control characters that openpyxl rejects
+        import re as _re
+        return _re.sub('[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f]', '', v)
+
     def body_cell(ws, row, col, val, alt_row=False, centre=False):
-        c = ws.cell(row=row, column=col, value=val)
+        c = ws.cell(row=row, column=col, value=_sanitise(val))
         c.font = bf
         c.fill = ALT_FILL if alt_row else WHT_FILL
         c.border = bdr
@@ -3990,6 +4006,9 @@ def main():
     ap.add_argument("--collapse-external", action="store_true")
     ap.add_argument("--hostname-file", metavar="FILE")
     ap.add_argument("--title", default="Network Diagram")
+    ap.add_argument("--internal-networks", metavar="CIDR", nargs="+",
+                    help="Additional CIDR ranges to treat as internal "
+                         "(e.g. 20.16.0.0/14 for corporate non-RFC1918 space)")
     args = ap.parse_args()
 
     base    = args.pcap.rsplit(".",1)[0]
@@ -4009,6 +4028,17 @@ def main():
         print("[!] No packets — valid PCAP?", file=sys.stderr); sys.exit(1)
 
     extra_hn = _load_hostname_file(args.hostname_file)
+    if args.internal_networks:
+        import ipaddress as _ipmod
+        parsed = []
+        for cidr in args.internal_networks:
+            try:
+                parsed.append(_ipmod.ip_network(cidr, strict=False))
+                print(f"[*] Treating {cidr} as internal network")
+            except ValueError as e:
+                print(f"[!] Bad --internal-networks value '{cidr}': {e}", file=sys.stderr)
+        if parsed:
+            extra_hn["__internal_networks__"] = parsed
     nodes, edges, rows, findings, cleartext_hits = build_graph(
         packets, args.min_packets, args.collapse_external, extra_hn)
 
