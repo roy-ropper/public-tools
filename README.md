@@ -3,9 +3,9 @@
 ## Pcap Parser
 
 ### description
-This tool was designed to ease the burden of network analysis while trawling big quantities of pcap traffic.
+This tool was designed to ease the burden of network analysis whilst conducting security audits of networks.
 
-It will output a spreadsheet and a diagram that can be viewed/edited on draw.io for maximum portability.
+It will output a spreadsheet and a diagram that can be viewed/edited on draw.io to provide a high-level overview of the network architecture associated with a project.
 
 ### usage
 ```python
