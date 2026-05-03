@@ -16,3 +16,13 @@ It will output a spreadsheet and a diagram that can be viewed/edited on draw.io 
 ```
 
 
+
+## Chat 
+
+### description
+Tool to directly interact with AI chat endpoints
+
+### usage
+```python
+    python3 chat.py
+```
